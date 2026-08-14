@@ -144,6 +144,11 @@ impl<'a> Outputs<'a> {
         self.env.on_device(name)
     }
 
+    /// Detaches an owned output from this run without copying it to the host.
+    pub fn take_device(&mut self, name: &str) -> Result<crate::DeviceTensor<'a>> {
+        self.env.take_device(name)
+    }
+
     /// Releases the run's buffers. Consuming instead of `Drop` because freeing
     /// device memory can fail, and swallowing that in a destructor would hide
     /// a leak.

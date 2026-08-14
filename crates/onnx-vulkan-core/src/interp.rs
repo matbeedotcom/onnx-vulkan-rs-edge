@@ -43,6 +43,9 @@ use crate::shaders::gemm::{
 use crate::shaders::grid_sample::{
     BINDINGS as GS_BINDINGS, GRID_SAMPLE, PAD_BORDER, PAD_ZEROS, PUSH_BYTES as GS_PUSH_BYTES,
 };
+use crate::shaders::group_query_attention::{
+    BINDINGS as GQA_BINDINGS, GQA, MAX_CONTEXT as GQA_MAX_CONTEXT, PUSH_BYTES as GQA_PUSH_BYTES,
+};
 use crate::shaders::matmul_fp32::{
     BINDINGS as MM_BINDINGS, GEMV as MM_GEMV, GEMV_BINDINGS as MM_GEMV_BINDINGS,
     GEMV_COLS as MM_GEMV_COLS, GEMV_PUSH_BYTES as MM_GEMV_PUSH_BYTES,
@@ -61,14 +64,19 @@ use crate::shaders::matmul_integer::{
     TILE_SIZE as MMI_TILE_SIZE, VECTOR_KEY as MMI_VECTOR_KEY, coop_applies as mmi_coop_applies,
     coop_variant as mmi_coop_variant, matmul as mmi_matmul,
 };
+use crate::shaders::matmul_nbits::{
+    BINDINGS as MMNB_BINDINGS, MATMUL_NBITS_Q4, PUSH_BYTES as MMNB_PUSH_BYTES,
+    WORKGROUP_SIZE as MMNB_WORKGROUP_SIZE,
+};
 use crate::shaders::movement::{
     CONCAT, CONCAT_BINDINGS, CONCAT_PUSH_BYTES, GATHER, GATHER_BINDINGS, GATHER_PUSH_BYTES, PAD,
     PAD_BINDINGS, PAD_PUSH_BYTES, SLICE, SLICE_BINDINGS, SLICE_PUSH_BYTES,
     TRANSPOSE as WGSL_TRANSPOSE, TRANSPOSE_BINDINGS, TRANSPOSE_PUSH_BYTES,
 };
 use crate::shaders::normalization::{
-    LAYERNORM, LAYERNORM_BINDINGS, LAYERNORM_PUSH_BYTES, SOFTMAX, SOFTMAX_BINDINGS,
-    SOFTMAX_PUSH_BYTES,
+    BATCHNORM, BATCHNORM_BINDINGS, BATCHNORM_PUSH_BYTES, LAYERNORM, LAYERNORM_BINDINGS,
+    LAYERNORM_PUSH_BYTES, RMSNORM, RMSNORM_BINDINGS, RMSNORM_PUSH_BYTES, SKIP_RMSNORM,
+    SKIP_RMSNORM_BINDINGS, SOFTMAX, SOFTMAX_BINDINGS, SOFTMAX_PUSH_BYTES,
 };
 use crate::shaders::pooling::{
     AVG_ACC as POOL_AVG_ACC, AVG_FIN as POOL_AVG_FIN, AVG_INIT as POOL_AVG_INIT,
@@ -141,6 +149,11 @@ pub fn is_implemented(op: &str) -> bool {
             | "Equal"
             | "Less"
             | "Greater"
+            | "LessOrEqual"
+            | "Identity"
+            | "BatchNormalization"
+            | "SimplifiedLayerNormalization"
+            | "If"
             | "Gelu"
             | "GatherElements"
             | "ScatterND"
@@ -187,6 +200,38 @@ pub fn is_implemented(op: &str) -> bool {
 /// then be run is a runtime error instead of a CPU fallback
 /// (`op-plan.md` §4b). Whoever decides coverage must use this.
 pub fn is_implemented_node(node: &NodeIr) -> bool {
+    // Operator names are scoped by domain. Treating `com.microsoft::Foo` as
+    // the standard `ai.onnx::Foo` can claim a node with different semantics
+    // and is worse than an explicit unsupported-model error. Contrib kernels
+    // must opt in below by both domain and operator name.
+    if !node.domain.is_empty() {
+        return node.domain == "com.microsoft"
+            && match node.op.as_str() {
+                "MatMulNBits" => {
+                    node.attrs.get("bits").and_then(AttrValue::as_i64) == Some(4)
+                        && node.attrs.get("block_size").and_then(AttrValue::as_i64) == Some(32)
+                        && node.inputs.len() == 3
+                }
+                "SkipSimplifiedLayerNormalization" => {
+                    node.inputs.len() >= 3 && node.outputs.len() == 1
+                }
+                "GroupQueryAttention" => {
+                    node.inputs.len() >= 9
+                        && node.outputs.len() == 3
+                        && node
+                            .attrs
+                            .get("num_heads")
+                            .and_then(AttrValue::as_i64)
+                            .is_some()
+                        && node
+                            .attrs
+                            .get("kv_num_heads")
+                            .and_then(AttrValue::as_i64)
+                            .is_some()
+                }
+                _ => false,
+            };
+    }
     if !is_implemented(&node.op) {
         return false;
     }
@@ -251,6 +296,12 @@ pub fn is_implemented_node(node: &NodeIr) -> bool {
                 "NOTSET" | "VALID"
             ) && !node.attrs.contains_key("output_shape")
         }
+        "If" => ["then_branch", "else_branch"].into_iter().all(|name| {
+            node.attrs
+                .get(name)
+                .and_then(AttrValue::as_graph)
+                .is_some_and(|graph| graph.nodes.iter().all(is_implemented_node))
+        }),
         _ => true,
     }
 }
@@ -348,6 +399,14 @@ fn exec_dispatch(env: &mut Env, node: &NodeIr) -> Result<()> {
         "Relu" => unary(env, node, "relu", "max(v, 0.0)"),
         "Softmax" => softmax(env, node),
         "LayerNormalization" => layernorm(env, node),
+        "SimplifiedLayerNormalization" => rmsnorm(env, node),
+        "SkipSimplifiedLayerNormalization" if node.domain == "com.microsoft" => {
+            skip_rmsnorm(env, node)
+        }
+        "GroupQueryAttention" if node.domain == "com.microsoft" => group_query_attention(env, node),
+        "BatchNormalization" => batchnorm(env, node),
+        "Identity" => unary(env, node, "Identity", "v"),
+        "If" => if_op(env, node),
         "Cast" => cast(env, node),
         "Mul" => elementwise_binary(env, node, "a[off_a] * b[off_b]", BinOp::Mul),
         "Add" => elementwise_binary(env, node, "a[off_a] + b[off_b]", BinOp::Add),
@@ -362,6 +421,7 @@ fn exec_dispatch(env: &mut Env, node: &NodeIr) -> Result<()> {
         "DynamicQuantizeLinear" => dynamic_quantize(env, node),
         "MatMulInteger" => matmul_integer(env, node),
         "MatMul" => matmul_fp32(env, node),
+        "MatMulNBits" if node.domain == "com.microsoft" => matmul_nbits_q4(env, node),
         "Gather" => gather(env, node),
         "Slice" => slice(env, node),
         "Where" => where_op(env, node),
@@ -379,6 +439,7 @@ fn exec_dispatch(env: &mut Env, node: &NodeIr) -> Result<()> {
         "Equal" => host_cmp(env, node, host_ops::CmpOp::Equal),
         "Less" => host_cmp(env, node, host_ops::CmpOp::Less),
         "Greater" => host_cmp(env, node, host_ops::CmpOp::Greater),
+        "LessOrEqual" => host_cmp(env, node, host_ops::CmpOp::LessOrEqual),
         "GatherElements" => gather_elements(env, node),
         "ScatterND" => scatter_nd(env, node),
         "TopK" => top_k(env, node),
@@ -417,6 +478,309 @@ fn exec_dispatch(env: &mut Env, node: &NodeIr) -> Result<()> {
         "Max" => elementwise_binary(env, node, "max(a[off_a], b[off_b])", BinOp::Max),
         other => bail!("compiling EP: op '{other}' not implemented in the interpreter"),
     }
+}
+
+fn if_op(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let condition = env
+        .host(&node.inputs[0])?
+        .to_i64()?
+        .first()
+        .copied()
+        .context("If: empty condition")?
+        != 0;
+    let branch_name = if condition {
+        "then_branch"
+    } else {
+        "else_branch"
+    };
+    let branch = node
+        .attrs
+        .get(branch_name)
+        .and_then(AttrValue::as_graph)
+        .with_context(|| format!("If: missing {branch_name}"))?;
+    ensure!(
+        branch.outputs.len() == node.outputs.len(),
+        "If: branch output count {} != node output count {}",
+        branch.outputs.len(),
+        node.outputs.len()
+    );
+    // Graph attributes carry their own initializer scope. They are not part of
+    // the parent graph's initializer table, so materialize the selected
+    // branch's constants as owned host values for the duration of the branch.
+    // ONNX names in a branch initializer scope must not overwrite a captured
+    // outer value.
+    for (name, initializer) in &branch.initializers {
+        ensure!(
+            !env.contains_runtime_value(name),
+            "If: branch initializer '{name}' shadows a captured runtime value"
+        );
+        env.set(
+            name,
+            Tensor::Host(HostTensor::new(
+                initializer.dtype,
+                initializer.shape.clone(),
+                initializer.data.clone(),
+            )),
+        );
+    }
+    // Captured outer-scope values are borrowed by the branch. Do not apply the
+    // branch-local liveness release to them; outer-graph liveness remains the
+    // authority after this node completes.
+    for branch_node in &branch.nodes {
+        exec_node(env, branch_node)?;
+    }
+    for (from, to) in branch.outputs.iter().zip(&node.outputs) {
+        env.move_value(from, to)?;
+    }
+    for name in branch.initializers.keys() {
+        env.release(name);
+    }
+    Ok(())
+}
+
+/// Q4 `com.microsoft::MatMulNBits` as exported by LiquidAI. This is the
+/// correctness-first direct kernel; tiled/dot-product variants can replace it
+/// without changing the graph or session contract.
+fn matmul_nbits_q4(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let attr = |name: &str| {
+        node.attrs
+            .get(name)
+            .and_then(AttrValue::as_i64)
+            .with_context(|| format!("MatMulNBits: missing '{name}'"))
+    };
+    let k = usize::try_from(attr("K")?).context("MatMulNBits: invalid K")?;
+    let n = usize::try_from(attr("N")?).context("MatMulNBits: invalid N")?;
+    ensure!(
+        attr("bits")? == 4,
+        "MatMulNBits: only 4-bit weights supported"
+    );
+    ensure!(
+        attr("block_size")? == 32,
+        "MatMulNBits: only block_size=32 supported"
+    );
+
+    env.ensure_device(&node.inputs[0])?;
+    env.ensure_device_dtype(&node.inputs[1])?;
+    env.ensure_device(&node.inputs[2])?;
+    let a = env.device(&node.inputs[0])?;
+    let a_shape = a.shape.clone();
+    ensure!(
+        a_shape.last().copied() == Some(k as i64),
+        "MatMulNBits: activation K {:?}, expected {k}",
+        a_shape.last()
+    );
+    let m = a.elem_count / k;
+    let w = env.device(&node.inputs[1])?;
+    let scales = env.device(&node.inputs[2])?;
+    ensure!(
+        w.dtype == UINT8,
+        "MatMulNBits: packed weights must be uint8"
+    );
+    ensure!(scales.dtype == FLOAT, "MatMulNBits: scales must be f32");
+    ensure!(
+        w.elem_count == n * k / 2,
+        "MatMulNBits: packed weight size {}, expected {}",
+        w.elem_count,
+        n * k / 2
+    );
+    ensure!(
+        scales.elem_count == n * k / 32,
+        "MatMulNBits: scale count {}, expected {}",
+        scales.elem_count,
+        n * k / 32
+    );
+
+    let elem_count = m.checked_mul(n).context("MatMulNBits: output overflow")?;
+    let ctx = env.context();
+    let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, elem_count)?)?;
+    if elem_count > 0 {
+        ensure!(
+            (elem_count as u64).div_ceil(MMNB_WORKGROUP_SIZE as u64) <= 65535,
+            "MatMulNBits: output requires more than one-dimensional Vulkan dispatch"
+        );
+        let mut push = Vec::with_capacity(MMNB_PUSH_BYTES as usize);
+        for value in [m as u32, k as u32, n as u32] {
+            push.extend_from_slice(&value.to_le_bytes());
+        }
+        with_pipeline(
+            env.cache(),
+            "MatMulNBitsQ4_B32",
+            || {
+                ctx.create_pipeline(
+                    &compile_wgsl(MATMUL_NBITS_Q4)?,
+                    MMNB_BINDINGS,
+                    MMNB_PUSH_BYTES,
+                )
+            },
+            |pipeline| {
+                ctx.stream_dispatch(
+                    pipeline,
+                    &[a.buffer(), w.buffer(), scales.buffer(), &out],
+                    &push,
+                    [(elem_count as u32).div_ceil(MMNB_WORKGROUP_SIZE), 1, 1],
+                )
+            },
+        )?;
+    }
+    let mut out_shape = a_shape;
+    *out_shape.last_mut().expect("activation rank checked") = n as i64;
+    env.set(
+        &node.outputs[0],
+        Tensor::Device(DevTensor {
+            dtype: FLOAT,
+            shape: out_shape,
+            elem_count,
+            buf: BufRef::Owned(out),
+        }),
+    );
+    Ok(())
+}
+
+fn group_query_attention(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let int_attr = |name: &str| {
+        node.attrs
+            .get(name)
+            .and_then(AttrValue::as_i64)
+            .with_context(|| format!("GroupQueryAttention: missing '{name}'"))
+    };
+    let q_heads = usize::try_from(int_attr("num_heads")?)
+        .context("GroupQueryAttention: invalid num_heads")?;
+    let kv_heads = usize::try_from(int_attr("kv_num_heads")?)
+        .context("GroupQueryAttention: invalid kv_num_heads")?;
+    ensure!(
+        q_heads > 0 && kv_heads > 0 && q_heads.is_multiple_of(kv_heads),
+        "GroupQueryAttention: invalid head ratio {q_heads}/{kv_heads}"
+    );
+    for input in node
+        .inputs
+        .iter()
+        .take(5)
+        .chain(node.inputs.iter().skip(7).take(2))
+    {
+        env.ensure_device(input)?;
+    }
+    let q = env.device(&node.inputs[0])?;
+    let k = env.device(&node.inputs[1])?;
+    let v = env.device(&node.inputs[2])?;
+    let past_k = env.device(&node.inputs[3])?;
+    let past_v = env.device(&node.inputs[4])?;
+    let cos = env.device(&node.inputs[7])?;
+    let sin = env.device(&node.inputs[8])?;
+    ensure!(q.shape.len() == 3, "GroupQueryAttention: Q rank must be 3");
+    let batch = usize::try_from(q.shape[0]).context("GroupQueryAttention: dynamic batch")?;
+    let seq = usize::try_from(q.shape[1]).context("GroupQueryAttention: dynamic sequence")?;
+    let q_width = usize::try_from(q.shape[2]).context("GroupQueryAttention: dynamic width")?;
+    ensure!(
+        q_width.is_multiple_of(q_heads),
+        "GroupQueryAttention: Q/head mismatch"
+    );
+    let head_dim = q_width / q_heads;
+    ensure!(
+        k.shape == vec![batch as i64, seq as i64, (kv_heads * head_dim) as i64]
+            && v.shape == k.shape,
+        "GroupQueryAttention: K/V shape mismatch"
+    );
+    ensure!(
+        past_k.shape.len() == 4
+            && past_k.shape[0] == batch as i64
+            && past_k.shape[1] == kv_heads as i64
+            && past_k.shape[3] == head_dim as i64
+            && past_v.shape == past_k.shape,
+        "GroupQueryAttention: past K/V shape mismatch"
+    );
+    let past_len = usize::try_from(past_k.shape[2]).context("GroupQueryAttention: dynamic past")?;
+    let total_len = past_len
+        .checked_add(seq)
+        .context("GroupQueryAttention: context overflow")?;
+    ensure!(
+        total_len <= GQA_MAX_CONTEXT as usize,
+        "GroupQueryAttention: context {total_len} exceeds Vulkan limit {GQA_MAX_CONTEXT}"
+    );
+    ensure!(
+        cos.elem_count >= total_len * (head_dim / 2)
+            && sin.elem_count >= total_len * (head_dim / 2),
+        "GroupQueryAttention: rotary cache too small"
+    );
+    let ctx = env.context();
+    let out_count = batch * seq * q_heads * head_dim;
+    let present_count = batch * kv_heads * total_len * head_dim;
+    let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, out_count)?)?;
+    let present_k = ctx.create_storage_buffer(device_storage_bytes(FLOAT, present_count)?)?;
+    let present_v = ctx.create_storage_buffer(device_storage_bytes(FLOAT, present_count)?)?;
+    let scale = node
+        .attrs
+        .get("scale")
+        .and_then(AttrValue::as_f32)
+        .unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt());
+    let do_rotary = node
+        .attrs
+        .get("do_rotary")
+        .and_then(AttrValue::as_i64)
+        .unwrap_or(0);
+    let mut push = Vec::with_capacity(GQA_PUSH_BYTES as usize);
+    for value in [
+        batch as u32,
+        seq as u32,
+        q_heads as u32,
+        kv_heads as u32,
+        head_dim as u32,
+        past_len as u32,
+        total_len as u32,
+    ] {
+        push.extend_from_slice(&value.to_le_bytes());
+    }
+    push.extend_from_slice(&scale.to_le_bytes());
+    push.extend_from_slice(&(do_rotary as u32).to_le_bytes());
+    with_pipeline(
+        env.cache(),
+        "GroupQueryAttention",
+        || ctx.create_pipeline(&compile_wgsl(GQA)?, GQA_BINDINGS, GQA_PUSH_BYTES),
+        |pipeline| {
+            ctx.stream_dispatch(
+                pipeline,
+                &[
+                    q.buffer(),
+                    k.buffer(),
+                    v.buffer(),
+                    past_k.buffer(),
+                    past_v.buffer(),
+                    cos.buffer(),
+                    sin.buffer(),
+                    &out,
+                    &present_k,
+                    &present_v,
+                ],
+                &push,
+                [q_heads as u32, seq as u32, batch as u32],
+            )
+        },
+    )?;
+    env.set(
+        &node.outputs[0],
+        Tensor::Device(DevTensor {
+            dtype: FLOAT,
+            shape: vec![batch as i64, seq as i64, q_width as i64],
+            elem_count: out_count,
+            buf: BufRef::Owned(out),
+        }),
+    );
+    for (name, buffer) in [(&node.outputs[1], present_k), (&node.outputs[2], present_v)] {
+        env.set(
+            name,
+            Tensor::Device(DevTensor {
+                dtype: FLOAT,
+                shape: vec![
+                    batch as i64,
+                    kv_heads as i64,
+                    total_len as i64,
+                    head_dim as i64,
+                ],
+                elem_count: present_count,
+                buf: BufRef::Owned(buffer),
+            }),
+        );
+    }
+    Ok(())
 }
 
 /// `Cast`: if the input is a 4-byte device activation (i32/f32) and the
@@ -1893,7 +2257,11 @@ fn conv_f32(env: &mut Env, node: &NodeIr) -> Result<()> {
         // from the 64×64 tile; see `conv::prefer_blocked`.
         let blocked = gemm && conv_prefer_blocked(pixels as usize, g.c_out as usize);
         let (key, source, tile) = match (gemm, split.is_some(), blocked) {
-            (true, true, _) => ("Conv_split", conv_blocked_splitk_source(), CONV_BLOCKED_TILE_SIZE),
+            (true, true, _) => (
+                "Conv_split",
+                conv_blocked_splitk_source(),
+                CONV_BLOCKED_TILE_SIZE,
+            ),
             (true, false, true) => ("Conv", conv_blocked_source(), CONV_BLOCKED_TILE_SIZE),
             (true, false, false) => ("Conv16", conv_gemm_source(), CONV_TILE_SIZE),
             _ => ("Conv_grouped", conv_direct_source(), 0),
@@ -3370,9 +3738,235 @@ fn layernorm(env: &mut Env, node: &NodeIr) -> Result<()> {
     Ok(())
 }
 
+fn rmsnorm(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let ctx = env.context();
+    env.ensure_device(&node.inputs[0])?;
+    env.ensure_device(&node.inputs[1])?;
+    let epsilon = node
+        .attrs
+        .get("epsilon")
+        .and_then(AttrValue::as_f32)
+        .unwrap_or(1e-5);
+    let x = env.device(&node.inputs[0])?;
+    let scale = env.device(&node.inputs[1])?;
+    let (shape, elem_count) = (x.shape.clone(), x.elem_count);
+    let (c, rows) = row_cols(&shape, elem_count, "SimplifiedLayerNormalization")?;
+    ensure!(
+        scale.elem_count == c,
+        "SimplifiedLayerNormalization: scale elem {} != {c}",
+        scale.elem_count
+    );
+    let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, elem_count)?)?;
+    if elem_count > 0 {
+        let mut push = Vec::with_capacity(RMSNORM_PUSH_BYTES as usize);
+        push.extend_from_slice(&(c as u32).to_le_bytes());
+        push.extend_from_slice(&epsilon.to_le_bytes());
+        with_pipeline(
+            env.cache(),
+            "SimplifiedLayerNormalization",
+            || {
+                ctx.create_pipeline(
+                    &compile_wgsl(RMSNORM)?,
+                    RMSNORM_BINDINGS,
+                    RMSNORM_PUSH_BYTES,
+                )
+            },
+            |pipeline| {
+                ctx.stream_dispatch(
+                    pipeline,
+                    &[x.buffer(), scale.buffer(), &out],
+                    &push,
+                    [rows as u32, 1, 1],
+                )
+            },
+        )?;
+    }
+    env.set(
+        &node.outputs[0],
+        Tensor::Device(DevTensor {
+            dtype: FLOAT,
+            shape,
+            elem_count,
+            buf: BufRef::Owned(out),
+        }),
+    );
+    Ok(())
+}
+
+fn skip_rmsnorm(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let ctx = env.context();
+    for input in node.inputs.iter().take(3) {
+        env.ensure_device(input)?;
+    }
+    let epsilon = node
+        .attrs
+        .get("epsilon")
+        .and_then(AttrValue::as_f32)
+        .unwrap_or(1e-5);
+    let x = env.device(&node.inputs[0])?;
+    let skip = env.device(&node.inputs[1])?;
+    let scale = env.device(&node.inputs[2])?;
+    let (shape, elem_count) = (x.shape.clone(), x.elem_count);
+    ensure!(
+        skip.shape == shape,
+        "SkipSimplifiedLayerNormalization: shape mismatch"
+    );
+    let (c, rows) = row_cols(&shape, elem_count, "SkipSimplifiedLayerNormalization")?;
+    ensure!(
+        scale.elem_count == c,
+        "SkipSimplifiedLayerNormalization: scale mismatch"
+    );
+    let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, elem_count)?)?;
+    if elem_count > 0 {
+        let mut push = Vec::with_capacity(RMSNORM_PUSH_BYTES as usize);
+        push.extend_from_slice(&(c as u32).to_le_bytes());
+        push.extend_from_slice(&epsilon.to_le_bytes());
+        with_pipeline(
+            env.cache(),
+            "SkipSimplifiedLayerNormalization",
+            || {
+                ctx.create_pipeline(
+                    &compile_wgsl(SKIP_RMSNORM)?,
+                    SKIP_RMSNORM_BINDINGS,
+                    RMSNORM_PUSH_BYTES,
+                )
+            },
+            |pipeline| {
+                ctx.stream_dispatch(
+                    pipeline,
+                    &[x.buffer(), skip.buffer(), scale.buffer(), &out],
+                    &push,
+                    [rows as u32, 1, 1],
+                )
+            },
+        )?;
+    }
+    env.set(
+        &node.outputs[0],
+        Tensor::Device(DevTensor {
+            dtype: FLOAT,
+            shape,
+            elem_count,
+            buf: BufRef::Owned(out),
+        }),
+    );
+    Ok(())
+}
+
+/// Inference-mode ONNX BatchNormalization for N,C,spatial tensors.
+fn batchnorm(env: &mut Env, node: &NodeIr) -> Result<()> {
+    ensure!(
+        node.inputs.len() >= 5 && node.outputs.len() == 1,
+        "BatchNormalization: only inference form is supported"
+    );
+    let ctx = env.context();
+    for input in node.inputs.iter().take(5) {
+        env.ensure_device(input)?;
+    }
+    let x = env.device(&node.inputs[0])?;
+    let shape = x.shape.clone();
+    ensure!(shape.len() >= 2, "BatchNormalization: input rank < 2");
+    let elem_count = x.elem_count;
+    let channels = usize::try_from(shape[1]).context("BatchNormalization: dynamic channels")?;
+    let spatial = shape[2..]
+        .iter()
+        .try_fold(1usize, |acc, &dim| {
+            acc.checked_mul(usize::try_from(dim).ok()?)
+        })
+        .context("BatchNormalization: invalid spatial shape")?;
+    let scale = env.device(&node.inputs[1])?;
+    let bias = env.device(&node.inputs[2])?;
+    let mean = env.device(&node.inputs[3])?;
+    let variance = env.device(&node.inputs[4])?;
+    ensure!(
+        [
+            scale.elem_count,
+            bias.elem_count,
+            mean.elem_count,
+            variance.elem_count
+        ]
+        .into_iter()
+        .all(|count| count == channels),
+        "BatchNormalization: parameter/channel mismatch"
+    );
+    let epsilon = node
+        .attrs
+        .get("epsilon")
+        .and_then(AttrValue::as_f32)
+        .unwrap_or(1e-5);
+    let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, elem_count)?)?;
+    if elem_count > 0 {
+        let groups = (elem_count as u64).div_ceil(256);
+        ensure!(groups <= 65535, "BatchNormalization: dispatch too large");
+        let mut push = Vec::with_capacity(BATCHNORM_PUSH_BYTES as usize);
+        for value in [elem_count as u32, channels as u32, spatial as u32] {
+            push.extend_from_slice(&value.to_le_bytes());
+        }
+        push.extend_from_slice(&epsilon.to_le_bytes());
+        with_pipeline(
+            env.cache(),
+            "BatchNormalization",
+            || {
+                ctx.create_pipeline(
+                    &compile_wgsl(BATCHNORM)?,
+                    BATCHNORM_BINDINGS,
+                    BATCHNORM_PUSH_BYTES,
+                )
+            },
+            |pipeline| {
+                ctx.stream_dispatch(
+                    pipeline,
+                    &[
+                        x.buffer(),
+                        scale.buffer(),
+                        bias.buffer(),
+                        mean.buffer(),
+                        variance.buffer(),
+                        &out,
+                    ],
+                    &push,
+                    [groups as u32, 1, 1],
+                )
+            },
+        )?;
+    }
+    env.set(
+        &node.outputs[0],
+        Tensor::Device(DevTensor {
+            dtype: FLOAT,
+            shape,
+            elem_count,
+            buf: BufRef::Owned(out),
+        }),
+    );
+    Ok(())
+}
+
 /// `Clip` (opset ≥6): bounds from attributes (opset 6) or scalar inputs
 /// (opset ≥11); a missing bound does not constrain that side.
 fn clip(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let input_dtype = env.dtype_of(&node.inputs[0])?;
+    if input_dtype != FLOAT {
+        let mut value = env.host(&node.inputs[0])?;
+        for (index, attr, op) in [(1, "min", BinOp::Max), (2, "max", BinOp::Min)] {
+            let bound = match node.inputs.get(index) {
+                Some(name) if !name.is_empty() => Some(env.host(name)?),
+                _ => node
+                    .attrs
+                    .get(attr)
+                    .and_then(AttrValue::as_f32)
+                    .map(|limit| {
+                        host_ops::cast(&HostTensor::from_f32(Vec::new(), &[limit]), input_dtype)
+                    })
+                    .transpose()?,
+            };
+            if let Some(bound) = bound {
+                value = host_ops::binary(&value, &bound, op)?;
+            }
+        }
+        env.set(&node.outputs[0], Tensor::Host(value));
+        return Ok(());
+    }
     let ctx = env.context();
     // the bound is a scalar: reading it host-side does not touch the GPU when it
     // is an initializer, and it is the only way to put it in the push constants
@@ -3862,15 +4456,15 @@ fn gemm(env: &mut Env, node: &NodeIr) -> Result<()> {
     Ok(())
 }
 
-/// `Resize` (opset ≥11) on [N, C, H, W]: nearest or bilinear, with `scales`
-/// or `sizes`; non-spatial dimensions must stay unchanged.
+/// `Resize` (opset ≥11) on [N, C, W] or [N, C, H, W]: nearest, linear, or
+/// cubic, with `scales` or `sizes`; non-spatial dimensions stay unchanged.
 fn resize(env: &mut Env, node: &NodeIr) -> Result<()> {
     let ctx = env.context();
     let x_name = node.inputs[0].clone();
     let x_shape = env.shape_of(&x_name)?;
     ensure!(
-        x_shape.len() == 4,
-        "Resize: only [N,C,H,W] tensors (rank {})",
+        matches!(x_shape.len(), 3 | 4),
+        "Resize: only [N,C,W] or [N,C,H,W] tensors (rank {})",
         x_shape.len()
     );
     let attr_str = |name: &str, default: &'static str| {
@@ -3926,23 +4520,31 @@ fn resize(env: &mut Env, node: &NodeIr) -> Result<()> {
     };
     let scales = optional(env, 2)?.filter(|v| !v.is_empty());
     let sizes = optional(env, 3)?.filter(|v| !v.is_empty());
-    let (h_in, w_in) = (x_shape[2], x_shape[3]);
+    let rank = x_shape.len();
+    let (h_in, w_in) = if rank == 4 {
+        (x_shape[2], x_shape[3])
+    } else {
+        (1, x_shape[2])
+    };
     let (h_out, w_out, scale_h, scale_w) = match (&scales, &sizes) {
         (Some(s), _) => {
-            ensure!(s.len() == 4, "Resize: scales of length {}", s.len());
+            ensure!(s.len() == rank, "Resize: scales of length {}", s.len());
             ensure!(
                 (s[0] - 1.0).abs() < 1e-6 && (s[1] - 1.0).abs() < 1e-6,
                 "Resize: scala != 1 su batch/canali ({}, {})",
                 s[0],
                 s[1]
             );
-            let h = (h_in as f32 * s[2]).floor() as i64;
-            let w = (w_in as f32 * s[3]).floor() as i64;
-            (h, w, s[2], s[3])
+            let scale_h = if rank == 4 { s[2] } else { 1.0 };
+            let scale_w = s[rank - 1];
+            let h = (h_in as f32 * scale_h).floor() as i64;
+            let w = (w_in as f32 * scale_w).floor() as i64;
+            (h, w, scale_h, scale_w)
         }
         (None, Some(s)) => {
-            ensure!(s.len() == 4, "Resize: sizes of length {}", s.len());
-            let (h, w) = (s[2] as i64, s[3] as i64);
+            ensure!(s.len() == rank, "Resize: sizes of length {}", s.len());
+            let h = if rank == 4 { s[2] as i64 } else { 1 };
+            let w = s[rank - 1] as i64;
             ensure!(
                 s[0] as i64 == x_shape[0] && s[1] as i64 == x_shape[1],
                 "Resize: sizes change batch/channels"
@@ -3955,7 +4557,11 @@ fn resize(env: &mut Env, node: &NodeIr) -> Result<()> {
 
     env.ensure_device(&x_name)?;
     let x = env.device(&x_name)?;
-    let out_shape = vec![x_shape[0], x_shape[1], h_out, w_out];
+    let out_shape = if rank == 4 {
+        vec![x_shape[0], x_shape[1], h_out, w_out]
+    } else {
+        vec![x_shape[0], x_shape[1], w_out]
+    };
     let elem_count = (x_shape[0] * x_shape[1] * h_out * w_out).max(0) as usize;
     let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, elem_count)?)?;
     if elem_count > 0 {

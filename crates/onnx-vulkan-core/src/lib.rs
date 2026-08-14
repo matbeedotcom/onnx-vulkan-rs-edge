@@ -17,7 +17,7 @@ pub mod shaders;
 pub mod shape;
 
 pub use cache::KernelCache;
-pub use device::{DeviceBuffer, DeviceTensor, Tensor};
+pub use device::{DeviceBuffer, DeviceTensor, PersistentTensor, SharedDeviceBuffer, Tensor};
 pub use error::{Error, Result};
 pub use execution::{ExecutionEnv, device_storage_bytes};
 pub use executor::{Executor, Outputs};

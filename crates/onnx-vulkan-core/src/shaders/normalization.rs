@@ -138,11 +138,111 @@ fn main(
 }
 "#;
 
+/// RMS normalization used by LiquidAI's `SimplifiedLayerNormalization`.
+pub const RMSNORM_BINDINGS: u32 = 3;
+pub const RMSNORM_PUSH_BYTES: u32 = 8;
+pub const RMSNORM: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> scale: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+struct Push { c: u32, eps: f32 }
+var<immediate> pc: Push;
+var<workgroup> ssq: array<f32, 256>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let base = wid.x * pc.c;
+    var sq = 0.0;
+    var i = lid.x;
+    while (i < pc.c) {
+        let v = x[base + i];
+        sq = sq + v * v;
+        i = i + 256u;
+    }
+    ssq[lid.x] = sq;
+    workgroupBarrier();
+    var s = 128u;
+    while (s > 0u) {
+        if (lid.x < s) { ssq[lid.x] = ssq[lid.x] + ssq[lid.x + s]; }
+        workgroupBarrier();
+        s = s / 2u;
+    }
+    let inv_rms = inverseSqrt(ssq[0] / f32(pc.c) + pc.eps);
+    i = lid.x;
+    while (i < pc.c) {
+        out[base + i] = x[base + i] * inv_rms * scale[i];
+        i = i + 256u;
+    }
+}
+"#;
+
+pub const SKIP_RMSNORM_BINDINGS: u32 = 4;
+pub const SKIP_RMSNORM: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> skip: array<f32>;
+@group(0) @binding(2) var<storage, read> scale: array<f32>;
+@group(0) @binding(3) var<storage, read_write> out: array<f32>;
+struct Push { c: u32, eps: f32 }
+var<immediate> pc: Push;
+var<workgroup> ssq: array<f32, 256>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let base = wid.x * pc.c;
+    var sq = 0.0;
+    var i = lid.x;
+    while (i < pc.c) {
+        let v = x[base + i] + skip[base + i];
+        sq = sq + v * v;
+        i = i + 256u;
+    }
+    ssq[lid.x] = sq;
+    workgroupBarrier();
+    var s = 128u;
+    while (s > 0u) {
+        if (lid.x < s) { ssq[lid.x] = ssq[lid.x] + ssq[lid.x + s]; }
+        workgroupBarrier();
+        s = s / 2u;
+    }
+    let inv_rms = inverseSqrt(ssq[0] / f32(pc.c) + pc.eps);
+    i = lid.x;
+    while (i < pc.c) {
+        out[base + i] = (x[base + i] + skip[base + i]) * inv_rms * scale[i];
+        i = i + 256u;
+    }
+}
+"#;
+
+pub const BATCHNORM_BINDINGS: u32 = 6;
+pub const BATCHNORM_PUSH_BYTES: u32 = 16;
+pub const BATCHNORM: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> scale: array<f32>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(3) var<storage, read> mean: array<f32>;
+@group(0) @binding(4) var<storage, read> variance: array<f32>;
+@group(0) @binding(5) var<storage, read_write> out: array<f32>;
+struct Push { count: u32, channels: u32, spatial: u32, eps: f32 }
+var<immediate> pc: Push;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= pc.count) { return; }
+    let c = (i / pc.spatial) % pc.channels;
+    out[i] = (x[i] - mean[c]) * inverseSqrt(variance[c] + pc.eps) * scale[c] + bias[c];
+}
+"#;
+
 #[cfg(test)]
 mod tests {
     #[test]
     fn sources_compile() {
-        for source in [super::SOFTMAX, super::LAYERNORM] {
+        for source in [
+            super::SOFTMAX,
+            super::LAYERNORM,
+            super::RMSNORM,
+            super::SKIP_RMSNORM,
+            super::BATCHNORM,
+        ] {
             vk_compute::compile_wgsl(source).expect("shader di normalizzazione valido");
         }
     }

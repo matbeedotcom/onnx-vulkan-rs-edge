@@ -30,7 +30,9 @@ impl std::fmt::Display for Error {
             Self::Unsupported(message) => {
                 write!(formatter, "unsupported ONNX model: {message}")
             }
-            Self::ExternalData(message) => write!(formatter, "unreadable external weights: {message}"),
+            Self::ExternalData(message) => {
+                write!(formatter, "unreadable external weights: {message}")
+            }
         }
     }
 }
@@ -58,6 +60,14 @@ pub fn model_to_ir(model: &proto::ModelProto, base_dir: Option<&Path>) -> Result
         .map(|o| (o.domain(), o.version()))
         .collect();
 
+    graph_to_ir(graph, &opsets, base_dir)
+}
+
+fn graph_to_ir(
+    graph: &proto::GraphProto,
+    opsets: &HashMap<&str, i64>,
+    base_dir: Option<&Path>,
+) -> Result<GraphIr> {
     let mut initializers = HashMap::with_capacity(graph.initializer.len());
     for tensor in &graph.initializer {
         let name = tensor.name().to_string();
@@ -75,7 +85,7 @@ pub fn model_to_ir(model: &proto::ModelProto, base_dir: Option<&Path>) -> Result
 
     let mut nodes = Vec::with_capacity(graph.node.len());
     for node in &graph.node {
-        nodes.push(node_to_ir(node, &opsets, base_dir)?);
+        nodes.push(node_to_ir(node, opsets, base_dir)?);
     }
 
     // Same normalization the EP applies in `GetCapability`: `axes` and the
@@ -181,7 +191,7 @@ fn node_to_ir(
     let mut attrs = HashMap::with_capacity(node.attribute.len());
     for attribute in &node.attribute {
         let name = attribute.name().to_string();
-        if let Some(value) = attribute_to_ir(attribute, base_dir)? {
+        if let Some(value) = attribute_to_ir(attribute, opsets, base_dir)? {
             attrs.insert(name, value);
         }
     }
@@ -201,6 +211,7 @@ fn node_to_ir(
 /// attribute as a reference inside a function body).
 fn attribute_to_ir(
     attribute: &proto::AttributeProto,
+    opsets: &HashMap<&str, i64>,
     base_dir: Option<&Path>,
 ) -> Result<Option<AttrValue>> {
     use proto::attribute_proto::AttributeType;
@@ -215,8 +226,7 @@ fn attribute_to_ir(
         AttributeType::Float => AttrValue::Float(attribute.f()),
         AttributeType::Floats => AttrValue::Floats(attribute.floats.clone()),
         AttributeType::String => AttrValue::String(
-            String::from_utf8(attribute.s().to_vec())
-                .map_err(|_| described("non-UTF-8 string"))?,
+            String::from_utf8(attribute.s().to_vec()).map_err(|_| described("non-UTF-8 string"))?,
         ),
         AttributeType::Tensor => {
             let tensor = attribute
@@ -225,10 +235,16 @@ fn attribute_to_ir(
                 .ok_or_else(|| described("tensor without value"))?;
             AttrValue::Tensor(tensor_to_initializer(tensor, base_dir)?)
         }
+        AttributeType::Graph => {
+            let graph = attribute
+                .g
+                .as_ref()
+                .ok_or_else(|| described("graph without value"))?;
+            AttrValue::Graph(Box::new(graph_to_ir(graph, opsets, base_dir)?))
+        }
         AttributeType::Undefined => return Ok(None),
-        // subgraphs (If/Loop/Scan), multiple strings, sparse tensors and
-        // type-proto: the interpreter does not run them, so the node carrying
-        // them must be rejected outright, not silently emptied
+        // Multiple strings, sparse tensors and type-proto are not represented
+        // by the core IR. Reject them rather than silently emptying an attr.
         other => return Err(described(&format!("{other:?}"))),
     }))
 }
@@ -323,9 +339,8 @@ fn read_external(tensor: &proto::TensorProto, base_dir: Option<&Path>) -> Result
             .transpose()
     };
 
-    let location = entry("location").ok_or_else(|| {
-        Error::ExternalData(format!("tensor '{name}': missing 'location' key"))
-    })?;
+    let location = entry("location")
+        .ok_or_else(|| Error::ExternalData(format!("tensor '{name}': missing 'location' key")))?;
     // the path is relative to the model directory, and must stay so: a `..`
     // in a downloaded file would read outside the model tree
     if Path::new(&location)
@@ -349,9 +364,9 @@ fn read_external(tensor: &proto::TensorProto, base_dir: Option<&Path>) -> Result
     let length = number("length")?
         .map(|n| n as usize)
         .unwrap_or_else(|| bytes.len().saturating_sub(offset));
-    let end = offset.checked_add(length).ok_or_else(|| {
-        Error::ExternalData(format!("tensor '{name}': offset+length overflow"))
-    })?;
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| Error::ExternalData(format!("tensor '{name}': offset+length overflow")))?;
     if end > bytes.len() {
         return Err(Error::ExternalData(format!(
             "tensor '{name}': requested bytes {offset}..{end} of a file of {}",

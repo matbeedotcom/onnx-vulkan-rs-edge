@@ -49,6 +49,10 @@ impl<'context, 'values> ExecutionEnv<'context, 'values> {
         self.values.get(name)
     }
 
+    pub fn contains_runtime_value(&self, name: &str) -> bool {
+        self.values.contains_key(name)
+    }
+
     /// Value is a graph constant, so anything derived from it can be cached
     /// across runs under its name.
     pub fn is_initializer(&self, name: &str) -> bool {
@@ -281,6 +285,40 @@ impl<'context, 'values> ExecutionEnv<'context, 'values> {
     pub fn set(&mut self, name: &str, tensor: Tensor<'values>) {
         self.values.insert(name.to_owned(), tensor);
         self.host_cache.borrow_mut().remove(name);
+    }
+
+    pub fn move_value(&mut self, from: &str, to: &str) -> Result<()> {
+        let value = self.values.remove(from).ok_or_else(|| {
+            Error::InvalidTensor(format!("value '{from}' not produced by selected branch"))
+        })?;
+        self.values.insert(to.to_owned(), value);
+        self.host_cache.borrow_mut().remove(from);
+        self.host_cache.borrow_mut().remove(to);
+        Ok(())
+    }
+
+    /// Removes an owned device value so it can outlive this execution.
+    pub fn take_device(&mut self, name: &str) -> Result<DeviceTensor<'values>> {
+        match self.values.remove(name) {
+            Some(Tensor::Device(
+                tensor @ DeviceTensor {
+                    buf: DeviceBuffer::Owned(_),
+                    ..
+                },
+            )) => {
+                self.host_cache.borrow_mut().remove(name);
+                Ok(tensor)
+            }
+            Some(other) => {
+                self.values.insert(name.to_owned(), other);
+                Err(Error::InvalidTensor(format!(
+                    "value '{name}' is not an owned device output"
+                )))
+            }
+            None => Err(Error::InvalidTensor(format!(
+                "device value '{name}' not present"
+            ))),
+        }
     }
 
     /// Drops a value the graph will not read again, returning its VRAM to the

@@ -133,8 +133,9 @@ unsafe fn write_output(
 
     match outputs.value(name) {
         Some(Tensor::Device(tensor)) => {
-            let byte_len = storage_len(tensor.dtype, tensor.elem_count)
-                .ok_or_else(|| anyhow::anyhow!("dtype {} has no fixed storage size", tensor.dtype))?;
+            let byte_len = storage_len(tensor.dtype, tensor.elem_count).ok_or_else(|| {
+                anyhow::anyhow!("dtype {} has no fixed storage size", tensor.dtype)
+            })?;
             if byte_len == 0 {
                 return Ok(());
             }

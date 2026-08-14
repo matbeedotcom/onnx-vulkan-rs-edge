@@ -27,7 +27,7 @@
 //!
 //! The Vulkan device is created once per process, on first use.
 
-use onnx_vulkan_core::{Executor, Tensor};
+use onnx_vulkan_core::{Executor, PersistentTensor, Tensor};
 use std::fmt;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -36,6 +36,46 @@ use vk_compute::VkContext;
 pub use onnx_vulkan_core::graph::ElementType;
 pub use onnx_vulkan_core::host_ops::HostTensor;
 pub use onnx_vulkan_frontend::Dim;
+
+/// A cloneable tensor that remains in Vulkan device memory between runs.
+#[derive(Clone)]
+pub struct DeviceValue(PersistentTensor<'static>);
+
+impl DeviceValue {
+    pub fn dtype(&self) -> i32 {
+        self.0.dtype
+    }
+
+    pub fn shape(&self) -> &[i64] {
+        &self.0.shape
+    }
+}
+
+/// A graph input supplied either from the host or a previous Vulkan run.
+pub enum InputValue {
+    Host(HostTensor),
+    Device(DeviceValue),
+}
+
+impl From<HostTensor> for InputValue {
+    fn from(value: HostTensor) -> Self {
+        Self::Host(value)
+    }
+}
+
+impl From<DeviceValue> for InputValue {
+    fn from(value: DeviceValue) -> Self {
+        Self::Device(value)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DeviceInfo {
+    pub name: String,
+    pub vendor_id: u32,
+    pub subgroup_size: u32,
+    pub integer_dot_product: bool,
+}
 
 /// Why a model could not be loaded or run.
 #[derive(Debug)]
@@ -197,6 +237,17 @@ impl Session {
         self.executor.graph().nodes.len()
     }
 
+    /// Physical device selected by the all-Vulkan session.
+    pub fn device_info(&self) -> DeviceInfo {
+        let context = self.executor.context();
+        DeviceInfo {
+            name: context.device_name.clone(),
+            vendor_id: context.vendor_id,
+            subgroup_size: context.subgroup_size,
+            integer_dot_product: context.has_integer_dot_product,
+        }
+    }
+
     /// Runs the graph once.
     ///
     /// The returned [`Run`] borrows the session, so its outputs stay readable
@@ -209,7 +260,22 @@ impl Session {
     where
         N: AsRef<str>,
     {
-        let supplied: Vec<(String, HostTensor)> = inputs
+        self.run_values(
+            inputs
+                .into_iter()
+                .map(|(name, value)| (name, InputValue::Host(value))),
+        )
+    }
+
+    /// Runs with host inputs and/or device-resident values from a prior run.
+    pub fn run_values<'a, N>(
+        &'a self,
+        inputs: impl IntoIterator<Item = (N, InputValue)>,
+    ) -> Result<Run<'a>>
+    where
+        N: AsRef<str>,
+    {
+        let supplied: Vec<(String, InputValue)> = inputs
             .into_iter()
             .map(|(name, tensor)| (name.as_ref().to_string(), tensor))
             .collect();
@@ -228,7 +294,13 @@ impl Session {
         }
         let bound: Vec<(&str, Tensor<'a>)> = supplied
             .iter()
-            .map(|(name, tensor)| (name.as_str(), Tensor::Host(tensor.clone())))
+            .map(|(name, tensor)| {
+                let tensor = match tensor {
+                    InputValue::Host(tensor) => Tensor::Host(tensor.clone()),
+                    InputValue::Device(tensor) => tensor.0.as_tensor(),
+                };
+                (name.as_str(), tensor)
+            })
             .collect();
         Ok(Run {
             outputs: self.executor.run(bound)?,
@@ -246,6 +318,15 @@ impl Run<'_> {
     /// synchronization point: it waits for the GPU.
     pub fn get(&self, name: &str) -> Result<HostTensor> {
         Ok(self.outputs.host(name)?)
+    }
+
+    /// Detaches an output as a persistent Vulkan value without host transfer.
+    pub fn take_device(&mut self, name: &str) -> Result<DeviceValue> {
+        let tensor = self.outputs.take_device(name)?;
+        Ok(DeviceValue(PersistentTensor::from_owned(
+            context()?,
+            tensor,
+        )?))
     }
 
     /// Releases the run's device buffers.

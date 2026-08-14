@@ -356,6 +356,7 @@ pub enum CmpOp {
     Equal,
     Less,
     Greater,
+    LessOrEqual,
     And,
 }
 
@@ -373,6 +374,7 @@ pub fn compare(a: &HostTensor, b: &HostTensor, op: CmpOp) -> Result<HostTensor> 
                 CmpOp::Equal => x == y,
                 CmpOp::Less => x < y,
                 CmpOp::Greater => x > y,
+                CmpOp::LessOrEqual => x <= y,
                 CmpOp::And => x != 0 && y != 0,
             } as u8;
         }
@@ -385,6 +387,7 @@ pub fn compare(a: &HostTensor, b: &HostTensor, op: CmpOp) -> Result<HostTensor> 
                 CmpOp::Equal => x == y,
                 CmpOp::Less => x < y,
                 CmpOp::Greater => x > y,
+                CmpOp::LessOrEqual => x <= y,
                 CmpOp::And => x != 0.0 && y != 0.0,
             } as u8;
         }

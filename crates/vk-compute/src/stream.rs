@@ -11,6 +11,18 @@ use crate::pipeline::{BufferSlice, ComputePipeline};
 use anyhow::{Context as _, Result};
 use ash::vk;
 
+// A single submitted command buffer containing an entire transformer decode
+// can exceed the Deck/RADV watchdog even when every individual dispatch is
+// bounded. Periodic ordered submissions preserve dependencies on the one queue
+// while preventing a multi-hundred-kernel graph from becoming one GPU job.
+// Decoder prefill scales every Q4 matmul by the prompt sequence length.  A
+// 32-dispatch submission is short enough for the one-token parity fixture but
+// can still become a multi-second RADV job for a real TTS prompt, which trips
+// the Deck's amdgpu watchdog and permanently loses the logical device.  Four
+// dispatches keeps production prefill submissions below that watchdog while
+// retaining ordered batching between dependent kernels.
+const MAX_DISPATCHES_PER_SUBMIT: u32 = 4;
+
 #[derive(Default)]
 pub(crate) struct StreamState {
     /// Command buffer being recorded (None = empty stream).
@@ -23,6 +35,7 @@ pub(crate) struct StreamState {
     ts_labels: Vec<&'static str>,
     /// Timestamps written into the current command buffer (0 = no baseline).
     ts_count: u32,
+    dispatch_count: u32,
 }
 
 impl VkContext {
@@ -49,6 +62,7 @@ impl VkContext {
         state.cmd = Some(cmd);
         state.ts_labels.clear();
         state.ts_count = 0;
+        state.dispatch_count = 0;
         // profiling: reset query pool + baseline timestamp at the start of the cmd buffer
         if self.profiling_on() {
             let pool = self.ensure_query_pool()?;
@@ -219,15 +233,22 @@ impl VkContext {
         push_constants: &[u8],
         groups: [u32; 3],
     ) -> Result<()> {
-        let mut state = self.stream.lock().unwrap();
-        let cmd = self.stream_cmd(&mut state)?;
-        self.stream_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-        );
-        self.record_dispatch(cmd, pipeline, buffers, push_constants, groups)?;
-        self.write_timestamp(cmd, &mut state);
+        let should_flush = {
+            let mut state = self.stream.lock().unwrap();
+            let cmd = self.stream_cmd(&mut state)?;
+            self.stream_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+            );
+            self.record_dispatch(cmd, pipeline, buffers, push_constants, groups)?;
+            self.write_timestamp(cmd, &mut state);
+            state.dispatch_count += 1;
+            state.dispatch_count >= MAX_DISPATCHES_PER_SUBMIT
+        };
+        if should_flush {
+            self.flush()?;
+        }
         Ok(())
     }
 

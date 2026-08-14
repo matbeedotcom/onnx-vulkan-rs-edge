@@ -152,6 +152,9 @@ pub enum AttrValue {
     Floats(Vec<f32>),
     String(String),
     Tensor(InitializerIr),
+    /// A control-flow branch (`If`, `Loop`, or `Scan`). Boxed to keep the IR
+    /// recursively owned without making the enum infinitely sized.
+    Graph(Box<GraphIr>),
 }
 
 impl AttrValue {
@@ -186,6 +189,13 @@ impl AttrValue {
     pub fn as_f32(&self) -> Option<f32> {
         match self {
             Self::Float(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    pub fn as_graph(&self) -> Option<&GraphIr> {
+        match self {
+            Self::Graph(graph) => Some(graph),
             _ => None,
         }
     }

@@ -301,8 +301,7 @@ fn load_reference(dir: &Path, session: &Session) -> Result<Reference> {
         if !path.exists() {
             return Ok(None);
         }
-        let bytes =
-            std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
         Ok(Some((path.display().to_string(), bytes)))
     };
 
