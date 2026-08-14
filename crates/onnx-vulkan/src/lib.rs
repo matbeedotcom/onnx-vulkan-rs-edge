@@ -248,6 +248,16 @@ impl Session {
         }
     }
 
+    /// Flush the persistent pipeline cache to disk. `VkContext` is a process
+    /// global that is never dropped, so relying on `Drop` does not work; call
+    /// this explicitly on graceful shutdown so a redeploy does not recompile
+    /// every SPIR-V kernel (RADV/ACO compile is minutes on the Deck).
+    pub fn persist_pipeline_cache(&self) {
+        if let Ok(ctx) = context() {
+            ctx.persist_pipeline_cache();
+        }
+    }
+
     /// Runs the graph once.
     ///
     /// The returned [`Run`] borrows the session, so its outputs stay readable

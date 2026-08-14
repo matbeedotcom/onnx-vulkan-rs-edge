@@ -291,3 +291,167 @@ fn enumerate_devices() {
         eprintln!("device: {name} (vendor 0x{vendor:04x}, {ty:?})");
     }
 }
+
+// --- MatMulNBits Q4: scalar vs tiled must agree (isolates tiled-kernel bugs) ---
+
+const NBITS_SCALAR: &str = r#"
+struct Params { m: u32, k: u32, n: u32 }
+var<immediate> pc: Params;
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> packed_w: array<u32>;
+@group(0) @binding(2) var<storage, read> scales: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+fn pbyte(bi: u32) -> u32 { let w = packed_w[bi >> 2u]; return (w >> ((bi & 3u) * 8u)) & 0xffu; }
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let oi = gid.x;
+    if (oi >= pc.m * pc.n) { return; }
+    let row = oi / pc.n; let col = oi - row * pc.n;
+    let blocks = pc.k / 32u; var sum = 0.0;
+    for (var kk = 0u; kk < pc.k; kk = kk + 1u) {
+        let bi = col * (pc.k / 2u) + (kk / 2u);
+        let byte = pbyte(bi);
+        let q = select(byte & 0x0fu, byte >> 4u, (kk & 1u) != 0u);
+        let scale = scales[col * blocks + kk / 32u];
+        sum = sum + a[row * pc.k + kk] * (f32(q) - 8.0) * scale;
+    }
+    y[oi] = sum;
+}
+"#;
+
+const NBITS_TILED: &str = r#"
+struct Params { m: u32, k: u32, n: u32 }
+var<immediate> pc: Params;
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> packed_w: array<u32>;
+@group(0) @binding(2) var<storage, read> scales: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+fn nibble_at(col: u32, kk: u32) -> f32 {
+    let bi = col * (pc.k / 2u) + (kk / 2u);
+    let word = packed_w[bi >> 2u];
+    let byte = (word >> ((bi & 3u) * 8u)) & 0xffu;
+    let q = select(byte & 0x0fu, byte >> 4u, (kk & 1u) != 0u);
+    return (f32(q) - 8.0) * scales[col * (pc.k / 32u) + kk / 32u];
+}
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let oi = gid.x;
+    if (oi >= pc.m * pc.n) { return; }
+    let row = oi / pc.n; let col = oi - row * pc.n;
+    let blocks = pc.k / 32u;
+    var sum = 0.0;
+    var kk = 0u;
+    for (; kk + 4u <= pc.k; kk = kk + 4u) {
+        let base = col * (pc.k / 2u) + (kk / 2u);
+        let wa = packed_w[base >> 2u];
+        let wb = packed_w[(base + 1u) >> 2u];
+        let ba = (wa >> ((base & 3u) * 8u)) & 0xffu;
+        let bb = (wb >> (((base + 1u) & 3u) * 8u)) & 0xffu;
+        let q0 = select(ba & 0x0fu, ba >> 4u, (kk & 1u) != 0u);
+        let q1 = select(ba & 0x0fu, ba >> 4u, ((kk + 1u) & 1u) != 0u);
+        let q2 = select(bb & 0x0fu, bb >> 4u, ((kk + 2u) & 1u) != 0u);
+        let q3 = select(bb & 0x0fu, bb >> 4u, ((kk + 3u) & 1u) != 0u);
+        let sa0 = scales[col * blocks + kk / 32u];
+        let sa1 = scales[col * blocks + (kk + 1u) / 32u];
+        let sa2 = scales[col * blocks + (kk + 2u) / 32u];
+        let sa3 = scales[col * blocks + (kk + 3u) / 32u];
+        let av = vec4<f32>(a[row * pc.k + kk], a[row * pc.k + kk + 1u],
+                           a[row * pc.k + kk + 2u], a[row * pc.k + kk + 3u]);
+        let wv = vec4<f32>((f32(q0) - 8.0) * sa0, (f32(q1) - 8.0) * sa1,
+                            (f32(q2) - 8.0) * sa2, (f32(q3) - 8.0) * sa3);
+        sum = sum + dot(av, wv);
+    }
+    for (; kk < pc.k; kk = kk + 1u) {
+        sum = sum + a[row * pc.k + kk] * nibble_at(col, kk);
+    }
+    y[oi] = sum;
+}
+"#;
+
+fn run_nbits(
+    ctx: &VkContext,
+    wgsl: &str,
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &[f32],
+    w: &[u8],
+    scales: &[f32],
+) -> Vec<f32> {
+    let scalar = compile_wgsl(wgsl).expect("compile");
+    let pipeline = ctx.create_pipeline(&scalar, 4, 12).unwrap();
+    // w: [N, K/2] u8 packed (low nibble first). scales: [N, K/32].
+    let w_u32: Vec<u32> = w
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let buf_a = ctx.create_storage_buffer((a.len() * 4) as u64).unwrap();
+    let buf_w = ctx.create_storage_buffer((w_u32.len() * 4) as u64).unwrap();
+    let buf_s = ctx.create_storage_buffer((scales.len() * 4) as u64).unwrap();
+    let buf_o = ctx.create_storage_buffer((m * n * 4) as u64).unwrap();
+    ctx.upload(&buf_a, as_bytes(a)).unwrap();
+    ctx.upload(&buf_w, as_bytes(&w_u32)).unwrap();
+    ctx.upload(&buf_s, as_bytes(scales)).unwrap();
+    let mut push = Vec::with_capacity(12);
+    for v in [m as u32, k as u32, n as u32] {
+        push.extend_from_slice(&v.to_le_bytes());
+    }
+    // Both kernels are @workgroup_size(256), one thread per output element.
+    let groups = [((m * n) as u32).div_ceil(256), 1, 1];
+    ctx.dispatch(&pipeline, &[&buf_a, &buf_w, &buf_s, &buf_o], &push, groups)
+        .unwrap();
+    let out: Vec<f32> = from_bytes(&ctx.download(&buf_o).unwrap());
+    ctx.destroy_buffer(buf_a);
+    ctx.destroy_buffer(buf_w);
+    ctx.destroy_buffer(buf_s);
+    ctx.destroy_buffer(buf_o);
+    ctx.destroy_pipeline(pipeline);
+    out
+}
+
+#[test]
+fn matmul_nbits_q4_scalar_vs_tiled() {
+    // Cover shapes that exercise the 32-element scale-block boundary (K>=32,
+    // including K straddling the boundary mid vec4-group) and non-multiples of
+    // 4 (scalar remainder path).
+    let shapes: &[(usize, usize, usize)] = &[
+        (4, 16, 96),
+        (1, 32, 8),     // K exactly one scale block
+        (1, 34, 8),     // K straddles block, not multiple of 4
+        (2, 64, 48),
+        (1, 300, 16),   // K straddles block mid vec4-group (kk=29 -> q3 in next block)
+        (3, 2048, 512), // depthformer-class shape
+    ];
+    // Single context: the host's VkContext create/drop crashes when repeated,
+    // so reuse one for all shapes and print a clear per-shape result.
+    let ctx = VkContext::new().expect("Vulkan context");
+    for &(m, k, n) in shapes {
+        let a: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.13).sin()).collect();
+        let w: Vec<u8> = (0..n * k / 2)
+            .map(|i| ((i * 31 + 5) & 0xff) as u8)
+            .collect();
+        let scales: Vec<f32> = (0..n * k / 32)
+            .map(|i| 0.02 + (i % 7) as f32 * 0.01)
+            .collect();
+        let expected = run_nbits(&ctx, NBITS_SCALAR, m, k, n, &a, &w, &scales);
+        let tiled = run_nbits(&ctx, NBITS_TILED, m, k, n, &a, &w, &scales);
+        assert_eq!(tiled.len(), expected.len(), "len mismatch m={m} k={k} n={n}");
+        let mut max_diff = 0.0f32;
+        for (i, (e, t)) in expected.iter().zip(&tiled).enumerate() {
+            let d = (e - t).abs();
+            if d > max_diff {
+                max_diff = d;
+                if d > 1e-2 {
+                    eprintln!(
+                        "mismatch m={m} k={k} n={n} at {i}: expected {e} tiled {t} (diff {d})"
+                    );
+                }
+            }
+        }
+        assert!(
+            max_diff < 1e-2,
+            "tiled kernel diverges m={m} k={k} n={n}: max_diff={max_diff}"
+        );
+        eprintln!("PASS m={m} k={k} n={n} max_diff={max_diff}");
+    }
+}

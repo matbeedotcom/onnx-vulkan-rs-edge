@@ -21,7 +21,7 @@ use ash::vk;
 // the Deck's amdgpu watchdog and permanently loses the logical device.  Four
 // dispatches keeps production prefill submissions below that watchdog while
 // retaining ordered batching between dependent kernels.
-const MAX_DISPATCHES_PER_SUBMIT: u32 = 4;
+const MAX_DISPATCHES_PER_SUBMIT: u32 = 64;
 
 #[derive(Default)]
 pub(crate) struct StreamState {

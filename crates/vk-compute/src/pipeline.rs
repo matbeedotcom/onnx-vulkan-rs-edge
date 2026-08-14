@@ -74,8 +74,17 @@ impl VkContext {
             let info = vk::ComputePipelineCreateInfo::default()
                 .stage(stage)
                 .layout(layout);
+            // Reuse the persistent pipeline cache so identical SPIR-V is not
+            // recompiled every cold start (RADV/ACO compile is minutes on Deck).
+            let cache_handle = self
+                .pipeline_cache
+                .lock()
+                .unwrap()
+                .as_ref()
+                .copied()
+                .unwrap_or(vk::PipelineCache::null());
             let pipeline = device
-                .create_compute_pipelines(vk::PipelineCache::null(), &[info], None)
+                .create_compute_pipelines(cache_handle, &[info], None)
                 .map_err(|(_, e)| e)?[0];
 
             Ok(ComputePipeline {

@@ -38,6 +38,9 @@ pub struct VkContext {
     pub subgroup_size: u32,
     pub device_name: String,
     pub vendor_id: u32,
+    /// Driver version (props.driver_version); keys the on-disk pipeline cache
+    /// so a driver update invalidates stale compiled pipelines.
+    pub driver_version: u32,
     pub(crate) allocator: Mutex<Option<Allocator>>,
     /// Serializes command pool + queue submit (not thread-safe in Vulkan).
     pub(crate) submit_lock: Mutex<()>,
@@ -57,6 +60,13 @@ pub struct VkContext {
     /// Device-local storage buffers freed by their owner and reusable by the
     /// next allocation of the same size (see `buffer.rs`).
     pub(crate) storage_pool: Mutex<crate::buffer::StoragePool>,
+    /// Persistent pipeline cache (see `pipeline_cache_path`). Loaded from disk
+    /// on device creation so SPIR-V does not have to be recompiled every cold
+    /// start; written back on `Drop`. RADV (Deck) ACO compilation of the
+    /// hundreds of kernels in a 1.5B model is minutes without this.
+    pub(crate) pipeline_cache: Mutex<Option<vk::PipelineCache>>,
+    /// Where the pipeline cache is persisted (None = do not persist).
+    pub(crate) pipeline_cache_path: Mutex<Option<std::path::PathBuf>>,
 }
 
 /// Timestamp slot in profiling query pool.
@@ -83,6 +93,7 @@ impl VkContext {
         let device_name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) }
             .to_string_lossy()
             .into_owned();
+        let driver_version = props.driver_version;
 
         // available device extensions
         let ext_props = unsafe { instance.enumerate_device_extension_properties(physical_device) }?;
@@ -206,6 +217,29 @@ impl VkContext {
             unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
         let timestamp_valid_bits = queue_families[queue_family_index as usize].timestamp_valid_bits;
 
+        // Persistent pipeline cache: load any on-disk blob for this exact
+        // device+driver, else start empty. Written back in `Drop`.
+        let cache_path = Self::pipeline_cache_path(&device_name, props.vendor_id, driver_version);
+        let pipeline_cache = cache_path.as_ref().and_then(|path| {
+            let initial = std::fs::read(path).ok();
+            let info = vk::PipelineCacheCreateInfo::default()
+                .initial_data(initial.as_deref().unwrap_or(&[]));
+            match unsafe { device.create_pipeline_cache(&info, None) } {
+                Ok(cache) => {
+                    log::info!(
+                        "Vulkan pipeline cache {} ({} bytes from disk)",
+                        path.display(),
+                        initial.as_ref().map(|b| b.len()).unwrap_or(0)
+                    );
+                    Some(cache)
+                }
+                Err(e) => {
+                    log::warn!("failed to create Vulkan pipeline cache: {e}");
+                    None
+                }
+            }
+        });
+
         log::info!(
             "Vulkan device: {device_name} (vendor 0x{:04x}), integer_dot_product={has_integer_dot_product}, \
              subgroup={subgroup_size}, coop_u8={coop_u8:?}",
@@ -225,6 +259,7 @@ impl VkContext {
             subgroup_size,
             device_name,
             vendor_id: props.vendor_id,
+            driver_version,
             allocator: Mutex::new(Some(allocator)),
             submit_lock: Mutex::new(()),
             stream: Mutex::new(Default::default()),
@@ -237,9 +272,38 @@ impl VkContext {
             },
             query_pool: Mutex::new(None),
             staging_pool: Mutex::new(Default::default()),
-            storage_pool: Mutex::new(Default::default()),
             storage_offset_alignment: props.limits.min_storage_buffer_offset_alignment.max(1),
+            storage_pool: Mutex::new(Default::default()),
+            pipeline_cache: Mutex::new(pipeline_cache),
+            pipeline_cache_path: Mutex::new(cache_path),
         })
+    }
+
+    /// Resolved on-disk path for the persistent pipeline cache. The cache is
+    /// keyed by device + vendor + driver version so a driver update (or a
+    /// different GPU) invalidates stale compiled pipelines rather than loading
+    /// them. Returns None when no writable cache directory is available.
+    fn pipeline_cache_path(
+        device_name: &str,
+        vendor_id: u32,
+        driver_version: u32,
+    ) -> Option<std::path::PathBuf> {
+        let safe: String = device_name
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '_' })
+            .collect();
+        let filename = format!("pipeline-{vendor_id:04x}-{safe}-{driver_version}.bin");
+        let dir = if let Ok(d) = std::env::var("ONNX_VULKAN_CACHE_DIR") {
+            std::path::PathBuf::from(d)
+        } else if let Ok(x) = std::env::var("XDG_CACHE_HOME") {
+            std::path::PathBuf::from(x).join("onnx-vulkan-rs")
+        } else if let Ok(h) = std::env::var("HOME") {
+            std::path::PathBuf::from(h).join(".cache/onnx-vulkan-rs")
+        } else {
+            std::path::PathBuf::from("/tmp/onnx-vulkan-rs")
+        };
+        let _ = std::fs::create_dir_all(&dir);
+        Some(dir.join(filename))
     }
 
     /// Enumerates physical devices with compute queues: (name, vendor_id, type).
@@ -269,7 +333,12 @@ impl VkContext {
 
     fn pick_device(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, u32)> {
         let devices = unsafe { instance.enumerate_physical_devices() }?;
-        let mut best: Option<(vk::PhysicalDevice, u32, i32)> = None;
+        // Optional env override: `ONNX_VULKAN_DEVICE` is either a 0-based index
+        // into the compute-capable list, or a substring matched (case-insensitive)
+        // against the device name. Lets a host with multiple Vulkan adapters pick
+        // a deterministic one (e.g. a discrete GPU vs a software/llvmpipe ICD).
+        let override_dev = std::env::var("ONNX_VULKAN_DEVICE").ok();
+        let mut matches: Vec<(vk::PhysicalDevice, u32, i32)> = Vec::new();
         for pd in devices {
             let families = unsafe { instance.get_physical_device_queue_family_properties(pd) };
             let Some(qfi) = families
@@ -285,13 +354,46 @@ impl VkContext {
                 vk::PhysicalDeviceType::VIRTUAL_GPU => 1,
                 _ => 0, // CPU (lavapipe) as last choice
             };
-            if best.is_none_or(|(_, _, s)| score > s) {
-                best = Some((pd, qfi as u32, score));
+            let name = unsafe {
+                std::ffi::CStr::from_ptr(props.device_name.as_ptr())
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            matches.push((pd, qfi as u32, score));
+            if let Some(ov) = &override_dev {
+                let is_index = ov.parse::<usize>().ok() == Some(matches.len() - 1);
+                let is_name = name.to_lowercase().contains(&ov.to_lowercase());
+                if is_index || is_name {
+                    return Ok((pd, qfi as u32));
+                }
             }
         }
+        let best = matches
+            .into_iter()
+            .max_by_key(|(_, _, s)| *s);
         match best {
             Some((pd, qfi, _)) => Ok((pd, qfi)),
             None => bail!("no Vulkan device with a compute queue"),
+        }
+    }
+
+    /// Explicitly flush the persistent pipeline cache to disk. Called on
+    /// graceful shutdown (and as a fallback in `Drop`) so a redeploy or
+    /// restart does not have to recompile every SPIR-V kernel.
+    pub fn persist_pipeline_cache(&self) {
+        let cache = self.pipeline_cache.lock().unwrap().take();
+        let path = self.pipeline_cache_path.lock().unwrap().clone();
+        if let (Some(cache), Some(path)) = (cache, path) {
+            unsafe {
+                if let Ok(data) = self.device.get_pipeline_cache_data(cache) {
+                    if let Err(e) = std::fs::write(&path, &data) {
+                        log::warn!("failed to persist Vulkan pipeline cache: {e}");
+                    } else {
+                        log::info!("persisted Vulkan pipeline cache: {} bytes", data.len());
+                    }
+                }
+                self.device.destroy_pipeline_cache(cache, None);
+            }
         }
     }
 
@@ -332,6 +434,19 @@ impl Drop for VkContext {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            // Persist the pipeline cache to disk before tearing down the device.
+            if let Some(cache) = self.pipeline_cache.lock().unwrap().take() {
+                if let Ok(data) = self.device.get_pipeline_cache_data(cache) {
+                    if let Some(path) = self.pipeline_cache_path.lock().unwrap().clone() {
+                        if let Err(e) = std::fs::write(&path, &data) {
+                            log::warn!("failed to persist Vulkan pipeline cache: {e}");
+                        } else {
+                            log::info!("persisted Vulkan pipeline cache: {} bytes", data.len());
+                        }
+                    }
+                }
+                self.device.destroy_pipeline_cache(cache, None);
+            }
             if let Some(pool) = self.query_pool.lock().unwrap().take() {
                 self.device.destroy_query_pool(pool, None);
             }

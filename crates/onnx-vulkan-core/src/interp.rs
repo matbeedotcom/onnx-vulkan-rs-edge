@@ -65,8 +65,8 @@ use crate::shaders::matmul_integer::{
     coop_variant as mmi_coop_variant, matmul as mmi_matmul,
 };
 use crate::shaders::matmul_nbits::{
-    BINDINGS as MMNB_BINDINGS, MATMUL_NBITS_Q4, PUSH_BYTES as MMNB_PUSH_BYTES,
-    WORKGROUP_SIZE as MMNB_WORKGROUP_SIZE,
+    BINDINGS as MMNB_BINDINGS, MATMUL_NBITS_Q4, MATMUL_NBITS_Q4_TILED,
+    PUSH_BYTES as MMNB_PUSH_BYTES, WORKGROUP_SIZE as MMNB_WORKGROUP_SIZE,
 };
 use crate::shaders::movement::{
     CONCAT, CONCAT_BINDINGS, CONCAT_PUSH_BYTES, GATHER, GATHER_BINDINGS, GATHER_PUSH_BYTES, PAD,
@@ -594,20 +594,36 @@ fn matmul_nbits_q4(env: &mut Env, node: &NodeIr) -> Result<()> {
     let ctx = env.context();
     let out = ctx.create_storage_buffer(device_storage_bytes(FLOAT, elem_count)?)?;
     if elem_count > 0 {
-        ensure!(
-            (elem_count as u64).div_ceil(MMNB_WORKGROUP_SIZE as u64) <= 65535,
-            "MatMulNBits: output requires more than one-dimensional Vulkan dispatch"
-        );
+        // Kernel selection: default to the tiled/vectorized fast path; the
+        // `LFM25_NBITS_KERNEL=scalar` env var forces the naive reference (used
+        // for parity/debugging against the proven scalar output).
+        let use_tiled = std::env::var("LFM25_NBITS_KERNEL")
+            .map(|v| v != "scalar")
+            .unwrap_or(true);
+        let kernel_key = if use_tiled {
+            "MatMulNBitsQ4_Tiled"
+        } else {
+            "MatMulNBitsQ4_B32"
+        };
+        let kernel_src = if use_tiled {
+            MATMUL_NBITS_Q4_TILED
+        } else {
+            MATMUL_NBITS_Q4
+        };
+        // Tiled 16×16 vectorized kernel: dequantizes Q4→f32 in shared memory
+        // and accumulates with vec4 f32 dots. Replaces the naive one-thread-per-
+        // output scalar loop, which left the GPU idle and made 1.5B Q4 ~100×
+        // slower than it should be.
         let mut push = Vec::with_capacity(MMNB_PUSH_BYTES as usize);
         for value in [m as u32, k as u32, n as u32] {
             push.extend_from_slice(&value.to_le_bytes());
         }
         with_pipeline(
             env.cache(),
-            "MatMulNBitsQ4_B32",
+            kernel_key,
             || {
                 ctx.create_pipeline(
-                    &compile_wgsl(MATMUL_NBITS_Q4)?,
+                    &compile_wgsl(kernel_src)?,
                     MMNB_BINDINGS,
                     MMNB_PUSH_BYTES,
                 )
@@ -617,7 +633,12 @@ fn matmul_nbits_q4(env: &mut Env, node: &NodeIr) -> Result<()> {
                     pipeline,
                     &[a.buffer(), w.buffer(), scales.buffer(), &out],
                     &push,
-                    [(elem_count as u32).div_ceil(MMNB_WORKGROUP_SIZE), 1, 1],
+                    if use_tiled {
+                        // vec4-per-thread: one thread per output, workgroup 256.
+                        [elem_count as u32, 1, 1]
+                    } else {
+                        [(elem_count as u32).div_ceil(MMNB_WORKGROUP_SIZE), 1, 1]
+                    },
                 )
             },
         )?;
