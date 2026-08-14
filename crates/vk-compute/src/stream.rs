@@ -15,13 +15,20 @@ use ash::vk;
 // can exceed the Deck/RADV watchdog even when every individual dispatch is
 // bounded. Periodic ordered submissions preserve dependencies on the one queue
 // while preventing a multi-hundred-kernel graph from becoming one GPU job.
-// Decoder prefill scales every Q4 matmul by the prompt sequence length.  A
-// 32-dispatch submission is short enough for the one-token parity fixture but
-// can still become a multi-second RADV job for a real TTS prompt, which trips
-// the Deck's amdgpu watchdog and permanently loses the logical device.  Four
-// dispatches keeps production prefill submissions below that watchdog while
-// retaining ordered batching between dependent kernels.
-const MAX_DISPATCHES_PER_SUBMIT: u32 = 4;
+//
+// Decoder prefill scales every Q4 matmul by the prompt sequence length, so a
+// long prompt could otherwise become one multi-second RADV job that trips the
+// Deck's amdgpu watchdog and permanently loses the logical device. That is the
+// case the cap guards against.
+//
+// Decode, by contrast, is O(1) in sequence length: one token is a bounded
+// ~40-60 dispatches of Q4 work, well under the watchdog. Flushing every 4
+// dispatches forces ~12 blocking queue_submit+wait_for_fences stalls per token
+// and is what made generation take minutes. 64 dispatches keeps a single
+// submission safely below the watchdog (a decode step is sub-second) while
+// collapsing the per-token sync tax to roughly one flush, which is what makes
+// real-time TTS latency attainable on the Deck.
+const MAX_DISPATCHES_PER_SUBMIT: u32 = 64;
 
 #[derive(Default)]
 pub(crate) struct StreamState {
