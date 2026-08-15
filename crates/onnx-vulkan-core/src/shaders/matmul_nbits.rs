@@ -127,6 +127,104 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// Q4 matmul with intra-workgroup split-K over the K reduction.
+///
+/// `MATMUL_NBITS_Q4_TILED` launches one thread per output element, each
+/// running the full K reduction serially. For the decode step (m == 1) that is
+/// only ~n threads for a 10-CU RDNA2, and even prefill (m == 31) leaves a
+/// long dependent-FMA chain per thread. This kernel instead has a
+/// 32-column × 8-k-lane workgroup (256 threads): lane `kl` reduces a
+/// contiguous 1/8 slice of K, the per-column partials meet in shared memory,
+/// and the 8 slices are summed in a fixed order. `gid.x` selects the output
+/// row, so the same kernel serves m == 1 and prefill. Every thread in a
+/// workgroup reads the SAME activation row slice (L1-cached) and 32 adjacent
+/// weight columns (contiguous 32×K/2 bytes), so both loads are fully
+/// coalesced.
+///
+/// Numerically the cross-lane summation reorders K vs the single-loop
+/// reference (each lane sums its own ascending slice, then the 8 slices are
+/// added in lane order) — a small, deterministic, tolerance-bounded FP
+/// difference of the same class the tiled kernel already has. Requires
+/// K % 32 == 0 (so each lane's slice is a whole number of vec4 steps); the
+/// caller falls back to the tiled kernel otherwise.
+pub const MATMUL_NBITS_Q4_SPLITK: &str = r#"
+struct Params { m: u32, k: u32, n: u32 }
+var<immediate> pc: Params;
+
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> packed_w: array<u32>;
+@group(0) @binding(2) var<storage, read> scales: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+
+const COLS: u32 = 32u;
+const KL: u32 = 8u;
+
+var<workgroup> partial: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_index) tid: u32,
+) {
+    // Mirrors the proven GEMV kernel (matmul_fp32) exactly for the reduction:
+    // tid → col_lane = tid % COLS, k_lane = tid / COLS, shared-memory tree
+    // reduction with a barrier at each level. That pattern is validated
+    // deterministic on RADV; a single-barrier read-all is not.
+    let col_lane = tid % COLS;
+    let k_lane = tid / COLS;
+    let row = wid.x;
+    let col = wid.z * COLS + col_lane;
+    let valid = col < pc.n;
+    let blocks = pc.k / 32u;
+    let k_chunk = pc.k / KL;
+    let k_start = k_lane * k_chunk;
+    var sum = 0.0;
+    if (valid) {
+        var kk = k_start;
+        for (; kk + 4u <= k_start + k_chunk; kk = kk + 4u) {
+            let base_byte = col * (pc.k / 2u) + (kk / 2u);
+            let wa = packed_w[base_byte >> 2u];
+            let wb = packed_w[(base_byte + 1u) >> 2u];
+            let byte_a = (wa >> ((base_byte & 3u) * 8u)) & 0xffu;
+            let byte_b = (wb >> (((base_byte + 1u) & 3u) * 8u)) & 0xffu;
+            let q0 = select(byte_a & 0x0fu, byte_a >> 4u, (kk & 1u) != 0u);
+            let q1 = select(byte_a & 0x0fu, byte_a >> 4u, ((kk + 1u) & 1u) != 0u);
+            let q2 = select(byte_b & 0x0fu, byte_b >> 4u, ((kk + 2u) & 1u) != 0u);
+            let q3 = select(byte_b & 0x0fu, byte_b >> 4u, ((kk + 3u) & 1u) != 0u);
+            let sa0 = scales[col * blocks + kk / 32u];
+            let sa1 = scales[col * blocks + (kk + 1u) / 32u];
+            let sa2 = scales[col * blocks + (kk + 2u) / 32u];
+            let sa3 = scales[col * blocks + (kk + 3u) / 32u];
+            let av = vec4<f32>(
+                a[row * pc.k + kk],
+                a[row * pc.k + kk + 1u],
+                a[row * pc.k + kk + 2u],
+                a[row * pc.k + kk + 3u],
+            );
+            let wv = vec4<f32>(
+                (f32(q0) - 8.0) * sa0,
+                (f32(q1) - 8.0) * sa1,
+                (f32(q2) - 8.0) * sa2,
+                (f32(q3) - 8.0) * sa3,
+            );
+            sum = sum + dot(av, wv);
+        }
+    }
+    partial[tid] = sum;
+    workgroupBarrier();
+    // Tree-reduce the KL lanes of each column; lane 0 holds the result.
+    for (var s = KL / 2u; s > 0u; s = s / 2u) {
+        if (k_lane < s) {
+            partial[tid] = partial[tid] + partial[tid + s * COLS];
+        }
+        workgroupBarrier();
+    }
+    if (k_lane == 0u && valid) {
+        y[row * pc.n + col] = partial[tid];
+    }
+}
+"#;
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -135,5 +233,7 @@ mod tests {
             .expect("MatMulNBits Q4 scalar shader must compile to SPIR-V");
         vk_compute::compile_wgsl(super::MATMUL_NBITS_Q4_TILED)
             .expect("MatMulNBits Q4 tiled shader must compile to SPIR-V");
+        vk_compute::compile_wgsl(super::MATMUL_NBITS_Q4_SPLITK)
+            .expect("MatMulNBits Q4 split-K shader must compile to SPIR-V");
     }
 }
