@@ -377,22 +377,24 @@ impl VkContext {
         }
     }
 
-    /// Explicitly flush the persistent pipeline cache to disk. Called on
-    /// graceful shutdown (and as a fallback in `Drop`) so a redeploy or
-    /// restart does not have to recompile every SPIR-V kernel.
+    /// Flush the persistent pipeline cache to disk **without destroying it**.
+    /// The cache is a process-global object owned by the `VkContext`, so it can
+    /// be serialized at any point and kept alive: later compiles (e.g. a second
+    /// model, or a runtime-specialized variant) accumulate into the same cache
+    /// and a subsequent call persists a strictly-more-complete blob. `Drop` is
+    /// the last-resort persist for the case no explicit call was made.
     pub fn persist_pipeline_cache(&self) {
-        let cache = self.pipeline_cache.lock().unwrap().take();
+        let cache = self.pipeline_cache.lock().unwrap();
         let path = self.pipeline_cache_path.lock().unwrap().clone();
-        if let (Some(cache), Some(path)) = (cache, path) {
+        if let (Some(cache), Some(path)) = (cache.as_ref(), path) {
             unsafe {
-                if let Ok(data) = self.device.get_pipeline_cache_data(cache) {
+                if let Ok(data) = self.device.get_pipeline_cache_data(*cache) {
                     if let Err(e) = std::fs::write(&path, &data) {
                         log::warn!("failed to persist Vulkan pipeline cache: {e}");
                     } else {
                         log::info!("persisted Vulkan pipeline cache: {} bytes", data.len());
                     }
                 }
-                self.device.destroy_pipeline_cache(cache, None);
             }
         }
     }

@@ -171,6 +171,20 @@ fn context() -> Result<&'static VkContext> {
         .map_err(|e| Error::Device(e.clone()))
 }
 
+/// Flush the process-global Vulkan pipeline cache to disk. No `Session` handle
+/// is needed: `VkContext` is a single shared object for the whole process
+/// (`context()` above), so every pipeline any session compiled since device
+/// creation lives in it. Call this after enough `run`s that the kernels you
+/// want cached have compiled (e.g. at the end of a generation) so a cold
+/// restart — the Deck's RADV/ACO compile is the expensive part — is skipped.
+/// It is non-destructive and idempotent: a later, more-complete state can be
+/// persisted again, and `VkContext::drop` persists as a last resort.
+pub fn persist_pipeline_cache() {
+    if let Ok(ctx) = context() {
+        ctx.persist_pipeline_cache();
+    }
+}
+
 /// A model loaded onto the GPU, ready to run any number of times.
 pub struct Session {
     executor: Executor<'static>,
@@ -184,14 +198,34 @@ impl Session {
     /// External weights are resolved relative to the model's own directory, as
     /// the ONNX specification prescribes.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-        Self::from_model(onnx_vulkan_frontend::load(path)?)
+        let name = path.as_ref().file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let t0 = std::time::Instant::now();
+        let model = onnx_vulkan_frontend::load(path)?;
+        eprintln!("[load] {name} frontend(read+parse)={}ms", t0.elapsed().as_millis());
+        let t1 = std::time::Instant::now();
+        let session = Self::from_model(model)?;
+        eprintln!("[load] {name} from_model(gpu-prep)={}ms", t1.elapsed().as_millis());
+        Ok(session)
     }
 
     /// Same as [`Session::load`], for a model already in memory. `base_dir` is
-    /// where external weights are looked up; `None` rejects a model that uses
-    /// them rather than guessing where they live.
+    /// where external weights are looked up; `None` rejects a model
+    /// that uses them instead of guessing.
     pub fn load_from_bytes(bytes: &[u8], base_dir: Option<&Path>) -> Result<Self> {
-        Self::from_model(onnx_vulkan_frontend::load_from_bytes(bytes, base_dir)?)
+        let t0 = std::time::Instant::now();
+        let model = onnx_vulkan_frontend::load_from_bytes(bytes, base_dir)?;
+        eprintln!(
+            "[load] parse+convert={}ms nodes={}",
+            t0.elapsed().as_millis(),
+            model.graph.nodes.len()
+        );
+        let t1 = std::time::Instant::now();
+        let session = Self::from_model(model)?;
+        eprintln!(
+            "[load] from_model(gpu-prep)={}ms",
+            t1.elapsed().as_millis()
+        );
+        Ok(session)
     }
 
     fn from_model(model: onnx_vulkan_frontend::Model) -> Result<Self> {
@@ -251,11 +285,10 @@ impl Session {
     /// Flush the persistent pipeline cache to disk. `VkContext` is a process
     /// global that is never dropped, so relying on `Drop` does not work; call
     /// this explicitly on graceful shutdown so a redeploy does not recompile
-    /// every SPIR-V kernel (RADV/ACO compile is minutes on the Deck).
+    /// every SPIR-V kernel (RADV/ACO compile is minutes on the Deck). See the
+    /// free-function [`persist_pipeline_cache`] for a form that needs no handle.
     pub fn persist_pipeline_cache(&self) {
-        if let Ok(ctx) = context() {
-            ctx.persist_pipeline_cache();
-        }
+        crate::persist_pipeline_cache();
     }
 
     /// Runs the graph once.
