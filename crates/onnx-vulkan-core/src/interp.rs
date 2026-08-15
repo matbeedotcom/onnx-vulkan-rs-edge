@@ -623,15 +623,30 @@ fn matmul_nbits_q4(env: &mut Env, node: &NodeIr) -> Result<()> {
     if elem_count > 0 {
         // Kernel selection:
         //   LFM25_NBITS_KERNEL=scalar  -> naive reference (parity/debug)
-        //   m == 1 and K % 32 == 0     -> split-K GEMV (decode step). One
-        //       thread per output leaves the GPU starved for the K-wide
-        //       reduction; split-K gives 8x the parallelism over K. (The m>1
-        //       generalization is not yet parity-validated — see follow-up.)
-        //   otherwise                  -> vec4 one-thread-per-output (prefill)
+        //   K % 32 == 0                -> split-K (default, all M), see below
+        //   otherwise                  -> vec4 one-thread-per-output (Tiled)
         let force_scalar = std::env::var("LFM25_NBITS_KERNEL")
             .map(|v| v == "scalar")
             .unwrap_or(false);
-        let use_splitk = !force_scalar && m == 1 && k.is_multiple_of(32);
+        // Kernel selection by M:
+        //   LFM25_NBITS_KERNEL=scalar  -> naive reference (parity/debug)
+        //   k % 32 == 0                -> split-K (default, all M). A 256-thread
+        //       workgroup is (32 cols x 8 k-lanes); each lane reduces a 1/8 K
+        //       slice, partials combined in shared memory. 8x K-parallelism over
+        //       the one-thread-per-output Tiled kernel, and the same weight
+        //       traffic — so it wins for BOTH the skinny decode GEMV (m==1) and
+        //       the small-M prefill (m=2..~144), which otherwise launch too few
+        //       threads with a long serial K chain.
+        //   LFM25_NBITS_SPLITK_MAX_M   -> cap the M that uses split-K (0 = no
+        //       cap, the default). Set =1 to route only decode to split-K and
+        //       keep prefill on Tiled (A/B benchmarking).
+        let splitk_max_m: u32 = std::env::var("LFM25_NBITS_SPLITK_MAX_M")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let use_splitk = !force_scalar
+            && (splitk_max_m == 0 || m as u32 <= splitk_max_m)
+            && k.is_multiple_of(32);
         // Env-gated shape dump for kernel design: prints the (m,n,k) of every
         // MatMulNBits dispatch so the prefill (m>1) geometry can be profiled.
         if std::env::var("LFM25_NBITS_SHAPES").is_ok() {
