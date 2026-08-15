@@ -1328,14 +1328,26 @@ fn host_transpose_2d(h: &HostTensor, out_shape: &[i64], es: usize) -> Result<Hos
                 let dst = (i * tc) * es;
                 tile[dst..dst + tc * es].copy_from_slice(&h.data[src..src + tc * es]);
             }
-            // Store: out[j0+j'][i0+i'] = tile[i'][j'], contiguous in i'.
+            // Scatter the tile's transpose into a second small (tc*tr*es-byte)
+            // buffer: tile_t[j'][i'] = tile[i'][j']. This scatter is
+            // cache-resident (<= 64 KB), so its uncoalesced access pattern is
+            // cheap. Writing into `data` directly element-by-element here would
+            // be fatal instead: successive writes stride r*es (256 MiB), so
+            // every single-byte store misses and evicts its cache line — the
+            // difference between ~0.1 s and ~1.2 s for the 134M-element tile.
+            let mut tile_t = vec![0u8; tc * tr * es];
             for jp in 0..tc {
-                let dst_base = ((j0 + jp) * r + i0) * es;
                 for ip in 0..tr {
-                    let src_off = (ip * tc + jp) * es;
-                    data[dst_base + ip * es..dst_base + (ip + 1) * es]
-                        .copy_from_slice(&tile[src_off..src_off + es]);
+                    let s = (ip * tc + jp) * es;
+                    let d = (jp * tr + ip) * es;
+                    tile_t[d..d + es].copy_from_slice(&tile[s..s + es]);
                 }
+            }
+            // Store: out row j0+jp is the contiguous run tile_t[jp][*].
+            for jp in 0..tc {
+                let dst = ((j0 + jp) * r + i0) * es;
+                let src = (jp * tr) * es;
+                data[dst..dst + tr * es].copy_from_slice(&tile_t[src..src + tr * es]);
             }
         }
     }
