@@ -53,6 +53,13 @@ impl<'context, 'values> ExecutionEnv<'context, 'values> {
         self.values.contains_key(name)
     }
 
+    /// Raw initializer record for `name`, if the graph declares it: the
+    /// cache key and the build closure read metadata/bytes from here so a
+    /// warm request never materializes a host copy of the weight.
+    pub fn initializer(&self, name: &str) -> Option<&InitializerIr> {
+        self.initializers.get(name)
+    }
+
     /// Value is a graph constant, so anything derived from it can be cached
     /// across runs under its name.
     pub fn is_initializer(&self, name: &str) -> bool {

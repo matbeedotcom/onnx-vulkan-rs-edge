@@ -31,6 +31,7 @@ pub struct KernelCache<'context> {
     pipelines: Mutex<HashMap<&'static str, Box<ComputePipeline>>>,
     packed: Mutex<HashMap<PackedKey, Box<GpuBuffer>>>,
     uploads: Mutex<HashMap<UploadKey, Box<GpuBuffer>>>,
+    transposed: Mutex<HashMap<(String, i32, usize), Box<GpuBuffer>>>,
     zero_scalar: Mutex<Option<Box<GpuBuffer>>>,
     pipeline_builds: AtomicUsize,
     packed_builds: AtomicUsize,
@@ -44,6 +45,7 @@ impl<'context> KernelCache<'context> {
             pipelines: Mutex::new(HashMap::new()),
             packed: Mutex::new(HashMap::new()),
             uploads: Mutex::new(HashMap::new()),
+            transposed: Mutex::new(HashMap::new()),
             zero_scalar: Mutex::new(None),
             pipeline_builds: AtomicUsize::new(0),
             packed_builds: AtomicUsize::new(0),
@@ -159,6 +161,48 @@ impl<'context> KernelCache<'context> {
     /// created: on a warm session this stops growing after the first run.
     pub fn uploads(&self) -> usize {
         self.upload_builds.load(Ordering::Relaxed)
+    }
+
+    /// Transposed initializer already resident in VRAM (see
+    /// [`Self::transposed_initializer`]), as a raw pointer. The pointer stays
+    /// valid as long as the cache lives.
+    pub(crate) fn transposed_initializer_cached(
+        &self,
+        key: &(String, i32, usize),
+    ) -> Option<*const GpuBuffer> {
+        let map = self.transposed.lock().expect("poisoned transpose cache");
+        map.get(key).map(|buffer| &**buffer as *const GpuBuffer)
+    }
+
+    /// Initializer pre-transposed `[r, c] -> [c, r]` and resident in VRAM.
+    ///
+    /// Some graphs carry a large constant that is only ever consumed in
+    /// transposed form (the LFM2.5 decoder transposes its 268 MB fp16
+    /// `embed_tokens.weight` — the shared LM head — on every execution: the
+    /// weight is fp16, so the device transpose path is unavailable and the
+    /// node falls back to a host clone + transpose + re-upload per run).
+    /// Materializing the transposed layout once, here, makes every later
+    /// execution a cache hit: the buffer's bytes are the initializer's bytes
+    /// in permuted order, so the GPU result is bit-identical to recomputing.
+    ///
+    /// The pointer stays valid as long as the cache lives.
+    pub(crate) fn transposed_initializer(
+        &self,
+        key: (String, i32, usize),
+        build: impl FnOnce() -> Result<GpuBuffer>,
+    ) -> Result<*const GpuBuffer> {
+        if let Some(existing) = self.transposed_initializer_cached(&key) {
+            return Ok(existing);
+        }
+        let built = Box::new(build()?);
+        let mut map = self.transposed.lock().expect("poisoned transpose cache");
+        match map.entry(key) {
+            Entry::Occupied(entry) => {
+                self.context.destroy_buffer(*built);
+                Ok(&**entry.into_mut() as *const GpuBuffer)
+            }
+            Entry::Vacant(entry) => Ok(&**entry.insert(built) as *const GpuBuffer),
+        }
     }
 
     /// Shared zero scalar buffer (4 bytes): missing zero-points read as 0.

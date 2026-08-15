@@ -1159,9 +1159,24 @@ fn transpose(env: &mut Env, node: &NodeIr) -> Result<()> {
     // (u8/i8) goes host-side: its consumer (e.g. MatMulInteger) is still on
     // the CPU EP anyway, so a host output is natural.
     let on_dev = env.on_device(src) && elem_size(env.dtype_of(src)?) == 4;
+    // A 2-D row-major transpose of a large INITIALIZER (constant across runs)
+    // is materialized ONCE and cached in VRAM: the LFM2.5 decoder transposes
+    // its 268 MB fp16 embed/LM-head weight on every execution, and fp16 is
+    // not device-eligible here, so without this each run paid a 268 MB host
+    // clone + transpose + re-upload (~1 s per step, ~43 s per 44-step TTS).
+    // The cached buffer holds the initializer's bytes in permuted order, so
+    // the GPU output is bit-identical to recomputing.
+    let cached = !on_dev
+        && rank == 2
+        && perm == [1, 0]
+        && env.is_initializer(src)
+        && in_shape.iter().product::<i64>() as usize * elem_size(env.dtype_of(src)?)
+            > 1_000_000;
     let t0 = vk_compute::trace::enabled().then(std::time::Instant::now);
     let shape_out = out_shape.clone();
-    let r = if on_dev {
+    let r = if cached {
+        transpose_cached_initializer(env, node, src, &in_shape, &out_shape)
+    } else if on_dev {
         transpose_device(env, node, &in_shape, &perm, out_shape)
     } else {
         let h = env.host(src)?;
@@ -1251,6 +1266,58 @@ fn transpose_device(
             shape: out_shape,
             elem_count: n,
             buf: BufRef::Owned(out),
+        }),
+    );
+    Ok(())
+}
+
+/// 2-D `[r, c] -> [c, r]` transpose of a large initializer, materialized ONCE
+/// in the session's [`KernelCache`] and reused by every later execution.
+///
+/// The build path (cache miss) runs the host transpose on the initializer's
+/// in-RAM bytes and uploads the result; the hit path is a map lookup plus a
+/// `Tensor::Device` insertion. The output dtype/shape are exactly what the
+/// device or plain-host path would produce, so the rest of the graph sees an
+/// identical tensor.
+fn transpose_cached_initializer(
+    env: &mut Env,
+    node: &NodeIr,
+    src: &str,
+    in_shape: &[i64],
+    out_shape: &[i64],
+) -> Result<()> {
+    let dtype = env.dtype_of(src)?;
+    let es = elem_size(dtype);
+    let (r, c) = (in_shape[0].max(0) as usize, in_shape[1].max(0) as usize);
+    let n = r * c;
+    let key = (src.to_owned(), dtype, n * es);
+    let ctx = env.context();
+    let ptr = env.cache().transposed_initializer(key, || {
+        // Build closure: host transpose (one-time, ~ms with the tiled fast
+        // path) + one upload. The initializer's bytes are already in RAM
+        // (`InitializerIr::data`), so this is a single copy, not a download.
+        let init = env
+            .initializer(src)
+            .ok_or_else(|| crate::Error::InvalidTensor(format!("initializer '{src}' missing")))?;
+        let h = HostTensor::new(dtype, in_shape.to_vec(), init.data.clone());
+        let out = host_transpose(&h, &[1, 0], out_shape)?;
+        let buffer = ctx.create_storage_buffer(device_storage_bytes(dtype, n)?)?;
+        if !out.data.is_empty() {
+            ctx.stream_upload(&buffer, &out.data)?;
+        }
+        Ok(buffer)
+    })?;
+    // SAFETY: KernelCache never removes entries and boxes them, so the
+    // pointer is valid for the whole session (same contract as
+    // `cached_initializer`).
+    let buf = unsafe { &*ptr };
+    env.set(
+        &node.outputs[0],
+        Tensor::Device(DevTensor {
+            dtype,
+            shape: out_shape.to_vec(),
+            elem_count: n,
+            buf: BufRef::Borrowed(buf),
         }),
     );
     Ok(())
