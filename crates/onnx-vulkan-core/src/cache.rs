@@ -28,7 +28,7 @@ type UploadKey = (String, i32, usize);
 
 pub struct KernelCache<'context> {
     context: &'context VkContext,
-    pipelines: Mutex<HashMap<&'static str, Box<ComputePipeline>>>,
+    pipelines: Mutex<HashMap<String, Box<ComputePipeline>>>,
     packed: Mutex<HashMap<PackedKey, Box<GpuBuffer>>>,
     uploads: Mutex<HashMap<UploadKey, Box<GpuBuffer>>>,
     transposed: Mutex<HashMap<(String, i32, usize), Box<GpuBuffer>>>,
@@ -66,18 +66,19 @@ impl<'context> KernelCache<'context> {
         )
     }
 
-    /// Pipeline for `key` (one per shader variant), compiled on first request.
+    /// Pipeline for `key` (one per shader variant; the key may encode extra
+    /// variants, e.g. a forced wave width), compiled on first request.
     /// The lock is not held during dispatch.
     ///
     /// The pointer stays valid as long as the cache lives.
     pub(crate) fn pipeline(
         &self,
-        key: &'static str,
+        key: String,
         build: impl FnOnce() -> Result<ComputePipeline>,
     ) -> Result<*const ComputePipeline> {
         {
             let map = self.pipelines.lock().expect("poisoned pipeline cache");
-            if let Some(existing) = map.get(key) {
+            if let Some(existing) = map.get(&key) {
                 return Ok(&**existing as *const ComputePipeline);
             }
         }

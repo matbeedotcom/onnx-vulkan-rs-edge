@@ -36,6 +36,12 @@ pub struct VkContext {
     /// Subgroup width, which is also the workgroup size of the cooperative
     /// matrix shaders (one subgroup computes one 16×16 tile).
     pub subgroup_size: u32,
+    /// `VK_EXT_subgroup_size_control` enabled: per-pipeline forced wave width
+    /// is available (see `create_pipeline_forced`).
+    pub subgroup_size_control: bool,
+    /// Wave width to force on the matmul pipelines (capability-based; see
+    /// `matmul_wave_size`). `None` = use the device default (no forced size).
+    pub matmul_wave_size: Option<u32>,
     pub device_name: String,
     pub vendor_id: u32,
     /// Driver version (props.driver_version); keys the on-disk pipeline cache
@@ -174,6 +180,48 @@ impl VkContext {
             }
         }
 
+        // VK_EXT_subgroup_size_control: enables per-pipeline forced wave width
+        // (32 vs the device default of 64 on Van Gogh). Enabling the feature is
+        // a no-op unless a pipeline opts in via
+        // `PipelineShaderStageRequiredSubgroupSizeCreateInfo`, so it is always
+        // on when the device supports it; the *opt-in* lives at the matmul call
+        // site (see [`Self::matmul_wave_size`]), never global — the integer
+        // cooperative-matrix kernel is compiled for one specific device
+        // subgroup size and must not be forced to another.
+        let mut size_control_features = vk::PhysicalDeviceSubgroupSizeControlFeatures::default();
+        let mut features2 =
+            vk::PhysicalDeviceFeatures2::default().push_next(&mut size_control_features);
+        unsafe { instance.get_physical_device_features2(physical_device, &mut features2) };
+        let subgroup_size_control = size_control_features.subgroup_size_control == vk::TRUE;
+        if subgroup_size_control {
+            enabled_exts.push(vk::EXT_SUBGROUP_SIZE_CONTROL_NAME.as_ptr());
+        }
+
+        // Default wave width for the matmul kernels, chosen once at startup from
+        // device capabilities (see `matmul_wave_size`). ON the VANGOGH (Deck) the
+        // device default is 64, but the matmul shaders are laid out for 32-wide
+        // waves (tid % 32 = output column); forcing 32 measured ~9% faster for
+        // both the decode SplitK and the prefill Tiled kernels, so 32 is the
+        // known-good profile whenever the device lets us force it and its
+        // default is not already 32. An env override pins a specific width.
+        let matmul_wave_size = if !subgroup_size_control {
+            None
+        } else if let Ok(v) = std::env::var("ONNX_VULKAN_REQUIRED_SUBGROUP_SIZE") {
+            match v.as_str() {
+                "32" => Some(32),
+                "64" => Some(64),
+                other => {
+                    log::warn!("ONNX_VULKAN_REQUIRED_SUBGROUP_SIZE={other} invalid (use 32|64); using capability default");
+                    (subgroup_size != 32).then_some(32u32)
+                }
+            }
+        } else {
+            (subgroup_size != 32).then_some(32u32)
+        };
+        if let Some(w) = matmul_wave_size {
+            log::info!("matmul wave width forced to {w} (device default {subgroup_size})");
+        }
+
         let queue_priorities = [1.0f32];
         let queue_info = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family_index)
@@ -184,6 +232,9 @@ impl VkContext {
             .enabled_extension_names(&enabled_exts);
         if has_integer_dot_product {
             device_info = device_info.push_next(&mut dot_features);
+        }
+        if subgroup_size_control {
+            device_info = device_info.push_next(&mut size_control_features);
         }
         if !coop_u8.is_empty() {
             device_info = device_info
@@ -257,6 +308,8 @@ impl VkContext {
             has_integer_dot_product,
             coop_u8,
             subgroup_size,
+            subgroup_size_control,
+            matmul_wave_size,
             device_name,
             vendor_id: props.vendor_id,
             driver_version,

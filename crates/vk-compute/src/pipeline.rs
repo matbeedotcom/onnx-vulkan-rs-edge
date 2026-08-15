@@ -38,6 +38,22 @@ impl VkContext {
         num_buffers: u32,
         push_const_size: u32,
     ) -> Result<ComputePipeline> {
+        self.create_pipeline_forced(spirv, num_buffers, push_const_size, None)
+    }
+
+    /// Like [`create_pipeline`], but with a forced subgroup (wave) width via
+    /// `VK_EXT_subgroup_size_control`. `required_subgroup_size` must divide the
+    /// shader's `@workgroup_size` (all matmul kernels use 256). Used to
+    /// benchmark the same kernel against wave32 vs the device-default wave64;
+    /// only the matmul pipeline opts in — the integer cooperative-matrix kernel
+    /// is compiled for one specific device subgroup size and must not be forced.
+    pub fn create_pipeline_forced(
+        &self,
+        spirv: &[u32],
+        num_buffers: u32,
+        push_const_size: u32,
+        required_subgroup_size: Option<u32>,
+    ) -> Result<ComputePipeline> {
         let device = &self.device;
         unsafe {
             let shader_module = device
@@ -67,10 +83,31 @@ impl VkContext {
             }
             let layout = device.create_pipeline_layout(&layout_info, None)?;
 
+            // The size-control struct's address is stored in `stage.p_next` and
+            // is dereferenced by the driver during `create_compute_pipelines`
+            // below, so it must outlive that call. Declare it in the outer
+            // scope; `Option::as_mut` gives a temporary `&mut` for `push_next`
+            // only.
+            let mut size_info_opt: Option<
+                vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo<'_>,
+            > = None;
             let stage = vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::COMPUTE)
                 .module(shader_module)
                 .name(c"main");
+            let stage = if let Some(size) = required_subgroup_size {
+                anyhow::ensure!(
+                    self.subgroup_size_control,
+                    "forced subgroup size {size} requested but the device lacks VK_EXT_subgroup_size_control"
+                );
+                size_info_opt = Some(
+                    vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
+                        .required_subgroup_size(size),
+                );
+                stage.push_next(size_info_opt.as_mut().expect("set just above"))
+            } else {
+                stage
+            };
             let info = vk::ComputePipelineCreateInfo::default()
                 .stage(stage)
                 .layout(layout);
@@ -86,6 +123,7 @@ impl VkContext {
             let pipeline = device
                 .create_compute_pipelines(cache_handle, &[info], None)
                 .map_err(|(_, e)| e)?[0];
+            drop(size_info_opt); // keep alive until after creation
 
             Ok(ComputePipeline {
                 pipeline,

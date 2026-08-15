@@ -314,7 +314,7 @@ fn with_pipeline<R>(
     run: impl FnOnce(&ComputePipeline) -> Result<R>,
 ) -> Result<R> {
     vk_compute::stats::set_op(key); // Pareto attribution by dispatch type
-    let pipeline = cache.pipeline(key, build)?;
+    let pipeline = cache.pipeline(key.to_owned(), build)?;
     // SAFETY: the cache never removes entries and keeps them in `Box`: the
     // address stays valid for the lifetime of the cache, which outlives execution.
     run(unsafe { &*pipeline })
@@ -632,6 +632,22 @@ fn matmul_nbits_q4(env: &mut Env, node: &NodeIr) -> Result<()> {
             .map(|v| v == "scalar")
             .unwrap_or(false);
         let use_splitk = !force_scalar && m == 1 && k.is_multiple_of(32);
+        // Wave width for the matmul pipeline, chosen at startup from device
+        // capabilities (ctx.matmul_wave_size): 32 on Van Gogh (device default
+        // 64) because the shaders are laid out for 32-wide waves, None where
+        // size control is unsupported or the default is already 32. Applied
+        // ONLY here — never globally — because the integer cooperative-matrix
+        // kernel is compiled for one specific device subgroup size.
+        let forced_subgroup: Option<u32> = ctx.matmul_wave_size;
+        // The forced wave width must be part of the pipeline identity: the
+        // default (no forced size) and a forced 32 are different pipelines. The
+        // env override can be 32, 64 or the capability default, so fold it into
+        // the key only when it actually differs from the device default — a
+        // force equal to the default produces the identical (unforced) pipeline.
+        let wave_key = forced_subgroup
+            .filter(|&s| s != ctx.subgroup_size)
+            .map(|s| format!("w{s}"))
+            .unwrap_or_default();
         let (kernel_key, kernel_src): (&'static str, &'static str) = if force_scalar {
             ("MatMulNBitsQ4_B32", MATMUL_NBITS_Q4)
         } else if use_splitk {
@@ -643,34 +659,35 @@ fn matmul_nbits_q4(env: &mut Env, node: &NodeIr) -> Result<()> {
         for value in [m as u32, k as u32, n as u32] {
             push.extend_from_slice(&value.to_le_bytes());
         }
-        with_pipeline(
-            env.cache(),
-            kernel_key,
-            || {
-                ctx.create_pipeline(
-                    &compile_wgsl(kernel_src)?,
-                    MMNB_BINDINGS,
-                    MMNB_PUSH_BYTES,
-                )
-            },
-            |pipeline| {
-                let grid: [u32; 3] = if force_scalar {
-                    [(elem_count as u32).div_ceil(MMNB_WORKGROUP_SIZE), 1, 1]
-                } else if use_splitk {
-                    // grid.x = output row, grid.z = 32-column tile. Each
-                    // workgroup is (32 cols x 8 k-lanes) = 256 threads.
-                    [m as u32, 1, (n as u32).div_ceil(32)]
-                } else {
-                    // vec4-per-thread: one thread per output, workgroup 256.
-                    [elem_count as u32, 1, 1]
-                };
-                ctx.stream_dispatch(
-                    pipeline,
-                    &[a.buffer(), w.buffer(), scales.buffer(), &out],
-                    &push,
-                    grid,
-                )
-            },
+        let full_key = format!("{kernel_key}{wave_key}");
+        vk_compute::stats::set_op(kernel_key); // Pareto attribution by family
+        let pipeline = env.cache().pipeline(full_key, || {
+            ctx.create_pipeline_forced(
+                &compile_wgsl(kernel_src)?,
+                MMNB_BINDINGS,
+                MMNB_PUSH_BYTES,
+                forced_subgroup,
+            )
+        })?;
+        // SAFETY: same contract as `with_pipeline` — the cache never removes
+        // entries and boxes them on the heap, so the address stays valid for
+        // the cache's lifetime, which outlives this execution.
+        let pipeline = unsafe { &*pipeline };
+        let grid: [u32; 3] = if force_scalar {
+            [(elem_count as u32).div_ceil(MMNB_WORKGROUP_SIZE), 1, 1]
+        } else if use_splitk {
+            // grid.x = output row, grid.z = 32-column tile. Each
+            // workgroup is (32 cols x 8 k-lanes) = 256 threads.
+            [m as u32, 1, (n as u32).div_ceil(32)]
+        } else {
+            // vec4-per-thread: one thread per output, workgroup 256.
+            [elem_count as u32, 1, 1]
+        };
+        ctx.stream_dispatch(
+            pipeline,
+            &[a.buffer(), w.buffer(), scales.buffer(), &out],
+            &push,
+            grid,
         )?;
     }
     let mut out_shape = a_shape;
