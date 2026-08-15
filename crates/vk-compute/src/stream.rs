@@ -32,12 +32,50 @@ use ash::vk;
 /// applies back-pressure (waits for the oldest). Bounded so a runaway producer
 /// cannot allocate unbounded command buffers / fences, while still giving the
 /// GPU several graphs of outstanding work to overlap.
+///
+/// Overridable at runtime via `LFM25_MAX_IN_FLIGHT` (1..=64). On drivers that
+/// are unstable with many concurrent submissions (e.g. RADV on the Steam Deck,
+/// which raises a GPU "soft recovery" / context-loss when too much work is
+/// queued at once), set this to `1`: the host still records the next graph
+/// while the current one executes (the overlap that matters), but only one
+/// command buffer is ever queued on the GPU at a time.
 const MAX_IN_FLIGHT: usize = 8;
+
+/// Resolves the in-flight submission cap, allowing a runtime override.
+fn max_in_flight() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("LFM25_MAX_IN_FLIGHT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| (1..=64).contains(&n))
+            .unwrap_or(MAX_IN_FLIGHT)
+    })
+}
 
 /// Maximum dispatches recorded into a single command buffer before `flush()`
 /// closes it (a hard sync boundary). Kept from the previous design: small graphs
 /// stay resident, large ones do not monopolize a command buffer.
+///
+/// Overridable at runtime via `ONNX_VULKAN_MAX_DISPATCHES_PER_SUBMIT` for
+/// bisecting GPU hangs: some drivers (RADV/ACO on the Steam Deck) lose the
+/// device when one command buffer carries too much work — a submission that
+/// exceeds the amdgpu gfx-ring watchdog (~5 s) is killed and the context
+/// soft-recovers. Shrinking the chunk moves the sync point earlier and can
+/// keep every submission under the watchdog.
 pub const MAX_DISPATCHES_PER_SUBMIT: usize = 64;
+
+/// Resolves the per-submission dispatch chunk, allowing a runtime override.
+pub fn max_dispatches_per_submit() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("ONNX_VULKAN_MAX_DISPATCHES_PER_SUBMIT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| (1..=1024).contains(&n))
+            .unwrap_or(MAX_DISPATCHES_PER_SUBMIT)
+    })
+}
 
 /// Work to run only after a submission's fence has signaled (GPU done with the
 /// resources it references).
@@ -52,6 +90,9 @@ struct Submission {
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
     on_complete: Vec<Deferred>,
+    /// Dispatch sequence the command buffer ended at: the submission covers
+    /// global dispatches `[start, dispatch_end)`. Trace-only.
+    dispatch_end: usize,
 }
 
 #[derive(Default)]
@@ -217,7 +258,8 @@ impl VkContext {
             );
             self.record_dispatch(cmd, pipeline, buffers, push_constants, groups)?;
             stream.pending_dispatches += 1;
-            stream.pending_dispatches >= MAX_DISPATCHES_PER_SUBMIT
+            crate::trace::record_dispatch();
+            stream.pending_dispatches >= max_dispatches_per_submit()
         };
         if should_flush {
             self.flush()?;
@@ -295,19 +337,23 @@ impl VkContext {
         if !stream.open {
             return Ok(()); // empty stream
         }
-        if stream.pending.len() >= MAX_IN_FLIGHT {
+        if stream.pending.len() >= max_in_flight() {
             let oldest = stream.pending.remove(0);
             drop(stream);
-            unsafe {
-                self.device
-                    .wait_for_fences(&[oldest.fence], true, u64::MAX)?;
-            }
-            self.run_completion(oldest)?;
+            // Reap the oldest submission (waits its fence, runs its deferred
+            // work, AND frees its command buffer + fence). Routing through
+            // `wait_and_reap` here — rather than a bare wait + run_completion —
+            // avoids leaking one command buffer and fence per back-pressure
+            // reap, which accumulates into exhaustion when the in-flight cap
+            // is 1 (every submission is reaped this way).
+            self.wait_and_reap(oldest)?;
             stream = self.stream.lock().unwrap();
         }
 
         let cmd = *stream.buffer.last().unwrap();
-        unsafe { self.device.end_command_buffer(cmd)?; }
+        unsafe {
+            self.device.end_command_buffer(cmd)?;
+        }
         stream.open = false;
         stream.pending_dispatches = 0;
 
@@ -317,16 +363,33 @@ impl VkContext {
         };
         let cmds = [cmd];
         let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+        if crate::trace::enabled() {
+            eprintln!(
+                "[trace] submit#{} dispatches={} (chunk cap {})",
+                stream.pending.len(),
+                stream.pending.len().saturating_sub(1),
+                max_dispatches_per_submit()
+            );
+        }
+        let t_submit = std::time::Instant::now();
         let result = unsafe {
             self.device
                 .queue_submit(self.queue, &[submit], fence)
                 .context("invio in coda (flush)")
         };
+        if crate::trace::enabled() {
+            eprintln!(
+                "[trace] submit#{} queue_submit={}ms",
+                stream.pending.len(),
+                t_submit.elapsed().as_millis()
+            );
+        }
         let mut on_complete: Vec<Deferred> = std::mem::take(&mut stream.pending_deferred);
         stream.pending.push(Submission {
             command_buffer: cmd,
             fence,
             on_complete,
+            dispatch_end: crate::trace::dispatch_seq(),
         });
         result?;
         Ok(())
@@ -356,10 +419,16 @@ impl VkContext {
         }
         // The submission's command buffer and fence are reclaimed by the caller
         // (wait_and_reap / finish_stream). Reset the descriptor arena only when
-        // the stream is fully drained: while submissions are in flight their
-        // bound sets must survive.
+        // the stream is fully idle: while submissions are in flight their bound
+        // sets must survive, AND so must the sets bound by the currently-OPEN
+        // command buffer (it records dispatches against the arena before its
+        // next flush). With the in-flight cap at 1, back-pressure reaps the
+        // oldest submission precisely when `pending` is momentarily empty while
+        // the next buffer is still recording — resetting here would invalidate
+        // those live sets and the GPU would read garbage descriptors (the
+        // Deck's non-finite depthformer logits).
         let stream = self.stream.lock().unwrap();
-        if stream.pending.is_empty() {
+        if stream.pending.is_empty() && !stream.open {
             drop(stream);
             self.reset_descriptors();
         }
@@ -371,9 +440,19 @@ impl VkContext {
     fn wait_and_reap(&self, sub: Submission) -> Result<()> {
         let fence = sub.fence;
         let cmd = sub.command_buffer;
+        let dispatch_end = sub.dispatch_end;
+        let t_wait = std::time::Instant::now();
         unsafe {
             self.device
                 .wait_for_fences(&[fence], true, u64::MAX)?;
+        }
+        crate::trace::record_flush_wait(t_wait.elapsed().as_nanos() as u64);
+        if crate::trace::enabled() {
+            eprintln!(
+                "[trace] wait: dispatches<={} took {}ms",
+                dispatch_end,
+                t_wait.elapsed().as_millis()
+            );
         }
         self.run_completion(sub)?;
         unsafe {
@@ -423,6 +502,7 @@ impl VkContext {
             src.size
         );
         crate::stats::record_down(bytes as u64);
+        let t_dl = std::time::Instant::now();
         // Submit any open (producer) command buffer so its result exists on the
         // GPU before we copy it. In-order use guarantees the open buffer is the
         // graph that produced `src` (the consumer graph is not yet recorded).
@@ -471,6 +551,7 @@ impl VkContext {
         }
         let data = staging.read_mapped(bytes)?;
         self.release_staging(staging, false);
+        crate::trace::record_download(t_dl.elapsed().as_nanos() as u64);
         Ok(data)
     }
 }

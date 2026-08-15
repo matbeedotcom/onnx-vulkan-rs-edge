@@ -70,6 +70,16 @@ pub fn record_gpu(op: &'static str, ns: u64) {
     e.1 += 1;
 }
 
+/// Cumulative GPU ns across all op types, WITHOUT resetting the counters.
+/// Used by the host-side trace summary (ONNX_VULKAN_TRACE) to say whether a
+/// slow graph is host-record-bound or GPU-execution-bound.
+pub fn gpu_time_total() -> u64 {
+    match GPU_TIME.lock() {
+        Ok(g) => g.as_ref().map(|m| m.values().map(|(ns, _)| *ns).sum()).unwrap_or(0),
+        Err(_) => 0,
+    }
+}
+
 pub fn record_flush(wall_ns: u64) {
     FLUSH_WALL_NS.fetch_add(wall_ns, Ordering::Relaxed);
     FLUSHES.fetch_add(1, Ordering::Relaxed);

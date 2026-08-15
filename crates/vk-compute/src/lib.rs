@@ -9,8 +9,9 @@ mod context;
 mod descriptor;
 mod pipeline;
 mod shader;
-pub mod stats;
 mod stream;
+pub mod stats;
+pub mod trace;
 
 pub use buffer::GpuBuffer;
 pub use context::{CoopMatU8, VkContext};
