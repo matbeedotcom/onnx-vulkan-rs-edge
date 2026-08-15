@@ -51,9 +51,13 @@ impl Model {
 /// downloaded model self-contained.
 pub fn load(path: impl AsRef<Path>) -> Result<Model> {
     let path = path.as_ref();
+    eprintln!("[load] {}: fs_read begin", path.display());
+    let t0 = std::time::Instant::now();
     let bytes = std::fs::read(path)
         .map_err(|e| Error::Malformed(format!("lettura di {}: {e}", path.display())))?;
-    load_from_bytes(&bytes, path.parent())
+    eprintln!("[load] {}: fs_read={}ms", path.display(), t0.elapsed().as_millis());
+    let model = load_from_bytes(&bytes, path.parent())?;
+    Ok(model)
 }
 
 /// Same as [`load`], for a model already in memory.

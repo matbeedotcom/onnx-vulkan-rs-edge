@@ -358,20 +358,46 @@ fn read_external(tensor: &proto::TensorProto, base_dir: Option<&Path>) -> Result
     })?;
 
     let path = base.join(&location);
-    let bytes = std::fs::read(&path)
+    let mut file = std::fs::File::open(&path)
         .map_err(|e| Error::ExternalData(format!("reading {}: {e}", path.display())))?;
+    let file_len = file
+        .metadata()
+        .map(|m| m.len() as usize)
+        .unwrap_or(0);
     let offset = number("offset")?.unwrap_or(0) as usize;
     let length = number("length")?
         .map(|n| n as usize)
-        .unwrap_or_else(|| bytes.len().saturating_sub(offset));
+        .unwrap_or_else(|| file_len.saturating_sub(offset));
     let end = offset
         .checked_add(length)
-        .ok_or_else(|| Error::ExternalData(format!("tensor '{name}': offset+length overflow")))?;
-    if end > bytes.len() {
+        .ok_or_else(|| Error::ExternalData(format!(
+            "tensor '{name}': offset+length overflow"
+        )))?;
+    if end > file_len {
         return Err(Error::ExternalData(format!(
-            "tensor '{name}': requested bytes {offset}..{end} of a file of {}",
-            bytes.len()
+            "tensor '{name}': requested bytes {offset}..{end} of a file of {file_len}"
         )));
     }
-    Ok(bytes[offset..end].to_vec())
+    // Seek + bounded read instead of fs::read of the whole file: one external
+    // file can hold hundreds of tensors (the LFM2.5 decoder packs 230 into a
+    // single 1.18 GB file), so a full read per tensor would move terabytes on
+    // a slow medium. Each tensor owns only its [offset, end) slice.
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(offset as u64))
+        .map_err(|e| Error::ExternalData(format!("seeking {}: {e}", path.display())))?;
+    let mut bytes = Vec::with_capacity(length);
+    file.take(length as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::ExternalData(format!(
+            "reading slice {offset}..{end} of {}: {e}",
+            path.display()
+        )))?;
+    if bytes.len() != length {
+        return Err(Error::ExternalData(format!(
+            "tensor '{name}': short read {} != {length} from {}",
+            bytes.len(),
+            path.display()
+        )));
+    }
+    Ok(bytes)
 }
