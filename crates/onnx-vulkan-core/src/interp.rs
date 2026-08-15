@@ -680,7 +680,17 @@ fn matmul_nbits_q4(env: &mut Env, node: &NodeIr) -> Result<()> {
             push.extend_from_slice(&value.to_le_bytes());
         }
         let full_key = format!("{kernel_key}{wave_key}");
-        vk_compute::stats::set_op(kernel_key); // Pareto attribution by family
+        // Pareto attribution: bucket the Q4 matmul by SHAPE (m, n, k), not just
+        // op name — a global average across decode (m=1, cheap) and prefill
+        // (m>1, the monster) is actively misleading. The kernel family is
+        // implicit in the shape: m=1 rows are the decode GEMV, m>1 rows are
+        // prefill. Stats-only; the pipeline cache key (full_key) is unchanged.
+        let stats_label = if vk_compute::stats::enabled() {
+            vk_compute::stats::intern(&format!("NBits m={m} n={n} k={k}"))
+        } else {
+            kernel_key
+        };
+        vk_compute::stats::set_op(stats_label);
         let pipeline = env.cache().pipeline(full_key, || {
             ctx.create_pipeline_forced(
                 &compile_wgsl(kernel_src)?,

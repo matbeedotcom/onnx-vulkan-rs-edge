@@ -31,6 +31,19 @@ pub fn current_op() -> &'static str {
     CURRENT_OP.with(|c| c.get())
 }
 
+/// Interns a dynamic label (e.g. a shape) into a `'static` one, so per-shape
+/// buckets can be profiled without changing the static-key plumbing. The label
+/// space is small (a handful of distinct matmul shapes), so leaking the first
+/// copy of each is cheap and keeps `GPU_TIME` keyed on `&'static str`.
+pub fn intern(label: &str) -> &'static str {
+    static TABLE: std::sync::OnceLock<Mutex<HashMap<String, &'static str>>> =
+        std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(Default::default);
+    let mut t = table.lock().unwrap();
+    *t.entry(label.to_string())
+        .or_insert_with(|| Box::leak(label.to_string().into_boxed_str()))
+}
+
 /// GPU ns and dispatch count per op type.
 static GPU_TIME: Mutex<Option<HashMap<&'static str, (u64, u64)>>> = Mutex::new(None);
 /// Cumulative wall-clock of flushes (GPU sync), ns.
