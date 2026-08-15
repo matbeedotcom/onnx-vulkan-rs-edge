@@ -325,16 +325,43 @@ fn with_pipeline<R>(
 /// Internal errors (anyhow, with context chain) are flattened into the core's
 /// typed error: the public API does not expose `anyhow`.
 pub fn execute(ir: &GraphIr, env: &mut Env<'_, '_>) -> crate::Result<()> {
-    execute_nodes(ir, env).map_err(|e| crate::Error::Backend(format!("{e:#}")))
+    let t0 = std::time::Instant::now();
+    let result = execute_nodes(ir, env).map_err(|e| crate::Error::Backend(format!("{e:#}")));
+    if vk_compute::trace::enabled() {
+        let wall = t0.elapsed().as_nanos() as u64;
+        let summary = vk_compute::trace::summary("graph");
+        eprintln!(
+            "[trace] graph wall={:.3}ms {}",
+            wall as f64 / 1e6,
+            if summary { "" } else { "(no dispatches)" }
+        );
+    }
+    result
 }
 
 fn execute_nodes(ir: &GraphIr, env: &mut Env<'_, '_>) -> Result<()> {
     let dead = dead_after(ir);
+    let tracing = vk_compute::trace::enabled();
+    // Per-node-type host wall time (ns) + count, for the current graph. The
+    // stream is async, so this is host recording cost (descriptor alloc +
+    // update + cmd recording + buffer pool churn), not GPU execution. A node
+    // type that is 10-30x slower per dispatch than its siblings points at the
+    // inefficiency (usually buffer-pool misses or a slow host-side kernel).
+    let mut node_ns: HashMap<&str, (u64, usize)> = HashMap::new();
     for (index, node) in ir.nodes.iter().enumerate() {
+        let t0 = tracing.then(std::time::Instant::now);
         exec_node(env, node)?;
+        if let Some(t0) = t0 {
+            let e = node_ns.entry(&*node.op).or_insert((0, 0));
+            e.0 += t0.elapsed().as_nanos() as u64;
+            e.1 += 1;
+        }
         for name in &dead[index] {
             env.release(name);
         }
+    }
+    if tracing {
+        vk_compute::trace::dump_node_types(&node_ns);
     }
     Ok(())
 }
@@ -1131,14 +1158,28 @@ fn transpose(env: &mut Env, node: &NodeIr) -> Result<()> {
     // GPU kernel only for 4-byte dtypes (f32/i32). A quantized activation
     // (u8/i8) goes host-side: its consumer (e.g. MatMulInteger) is still on
     // the CPU EP anyway, so a host output is natural.
-    if env.on_device(src) && elem_size(env.dtype_of(src)?) == 4 {
+    let on_dev = env.on_device(src) && elem_size(env.dtype_of(src)?) == 4;
+    let t0 = vk_compute::trace::enabled().then(std::time::Instant::now);
+    let shape_out = out_shape.clone();
+    let r = if on_dev {
         transpose_device(env, node, &in_shape, &perm, out_shape)
     } else {
         let h = env.host(src)?;
         let out = host_transpose(&h, &perm, &out_shape)?;
         env.set(&node.outputs[0], Tensor::Host(out));
         Ok(())
+    };
+    if let Some(t0) = t0 {
+        eprintln!(
+            "[trace] transpose path={} in={:?} out={:?} perm={:?} took={}ms",
+            if on_dev { "device" } else { "host" },
+            in_shape,
+            shape_out,
+            perm,
+            t0.elapsed().as_millis()
+        );
     }
+    r
 }
 
 /// GPU permutation of an activation (reuses `WGSL_TRANSPOSE`; 4-byte dtype).
@@ -1224,6 +1265,14 @@ fn host_transpose(h: &HostTensor, perm: &[usize], out_shape: &[i64]) -> Result<H
         "Transpose host: dtype {} with unknown size",
         h.dtype
     );
+    // Fast path for the common 2-D case (e.g. the 134M-element audio
+    // [65536, 2048] -> [2048, 65536] perm in the TTS loop). The generic
+    // per-element loop below is O(n*rank) with divisions and byte-wise
+    // copies: ~5.8 s for 134M elements. A tiled transpose streams contiguous
+    // rows in and out and runs in ~0.2 s.
+    if rank == 2 && perm == [1, 0] {
+        return host_transpose_2d(h, out_shape, es);
+    }
     let mut in_strides = vec![0usize; rank];
     let mut acc = 1usize;
     for d in (0..rank).rev() {
@@ -1243,6 +1292,52 @@ fn host_transpose(h: &HostTensor, perm: &[usize], out_shape: &[i64]) -> Result<H
             src += ((o / acc2.max(1)) % sh) * perm_strides[d];
         }
         data[o * es..(o + 1) * es].copy_from_slice(&h.data[src * es..(src + 1) * es]);
+    }
+    Ok(HostTensor::new(h.dtype, out_shape.to_vec(), data))
+}
+
+/// Tiled fast path for the common 2-D row-major `[r, c] -> [c, r]`
+/// transpose. The generic per-element loop above is O(n*rank) with a
+/// division per dimension and byte-wise copies: ~5.8 s for the 134M-element
+/// `[65536, 2048]` activation in the LFM2.5 TTS loop. This version reads the
+/// input in contiguous row tiles (cache-friendly), holds each tile in a small
+/// stack-sized buffer, and writes the output rows contiguously, so memory
+/// traffic is ~2x the tensor size (~ms, not ~s).
+fn host_transpose_2d(h: &HostTensor, out_shape: &[i64], es: usize) -> Result<HostTensor> {
+    let r = h.shape[0].max(0) as usize;
+    let c = h.shape[1].max(0) as usize;
+    let n = r * c;
+    if n == 0 {
+        return Ok(HostTensor::new(h.dtype, out_shape.to_vec(), Vec::new()));
+    }
+    const TR: usize = 256;
+    const TC: usize = 64;
+    let mut tile = vec![0u8; TR * TC * es];
+    let mut data = vec![0u8; n * es];
+    // out[a][b] = in[b][a]. Tile in[i0..i0+tr][j0..j0+tc]; the transposed tile
+    // is out[j0..j0+tc][i0..i0+tr]. Load coalesced from `h`, store coalesced
+    // into `data` (each out row is a contiguous run); the middle transpose runs
+    // entirely inside the small, cache-resident tile.
+    for i0 in (0..r).step_by(TR) {
+        let tr = TR.min(r - i0);
+        for j0 in (0..c).step_by(TC) {
+            let tc = TC.min(c - j0);
+            // Load: tile[i][j] = in[i0+i][j0+j], coalesced row copies.
+            for i in 0..tr {
+                let src = ((i0 + i) * c + j0) * es;
+                let dst = (i * tc) * es;
+                tile[dst..dst + tc * es].copy_from_slice(&h.data[src..src + tc * es]);
+            }
+            // Store: out[j0+j'][i0+i'] = tile[i'][j'], contiguous in i'.
+            for jp in 0..tc {
+                let dst_base = ((j0 + jp) * r + i0) * es;
+                for ip in 0..tr {
+                    let src_off = (ip * tc + jp) * es;
+                    data[dst_base + ip * es..dst_base + (ip + 1) * es]
+                        .copy_from_slice(&tile[src_off..src_off + es]);
+                }
+            }
+        }
     }
     Ok(HostTensor::new(h.dtype, out_shape.to_vec(), data))
 }
@@ -4725,4 +4820,60 @@ fn unary_with_helpers(
         }),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod host_transpose_2d_tests {
+    use super::host_transpose_2d;
+    use crate::host_ops::{HostTensor, INT8, UINT8};
+
+    /// Naive O(n*rank) reference: out[a][b] = in[b][a].
+    fn reference_2d(in_data: &[u8], r: usize, c: usize) -> Vec<u8> {
+        let mut out = vec![0u8; r * c];
+        for a in 0..c {
+            for b in 0..r {
+                out[a * r + b] = in_data[b * c + a];
+            }
+        }
+        out
+    }
+
+    fn run(dtype: i32, r: usize, c: usize, seed: u64) -> bool {
+        let n = r * c;
+        // Deterministic pseudo-random bytes.
+        let mut state = seed;
+        let mut in_data = Vec::with_capacity(n);
+        for i in 0..n {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            in_data.push((state >> 33) as u8 ^ (i as u8));
+        }
+        let h = HostTensor::new(dtype, vec![r as i64, c as i64], in_data.clone());
+        let got = host_transpose_2d(&h, &[c as i64, r as i64], 1).unwrap();
+        let want = reference_2d(&in_data, r, c);
+        assert_eq!(got.shape, vec![c as i64, r as i64]);
+        got.data == want
+    }
+
+    #[test]
+    fn u8_small() {
+        assert!(run(UINT8, 100, 7, 1));
+        assert!(run(UINT8, 1, 1, 2));
+        assert!(run(UINT8, 1, 64, 3));
+        assert!(run(UINT8, 64, 1, 4));
+    }
+
+    #[test]
+    fn u8_dimensions_not_multiples_of_tiles() {
+        // TR=256, TC=64: shapes that leave partial trailing tiles.
+        assert!(run(UINT8, 256 * 3 + 17, 64 * 2 + 9, 5));
+        assert!(run(UINT8, 31, 57, 6));
+        assert!(run(INT8, 200, 200, 7));
+    }
+
+    #[test]
+    fn u8_real_tts_shape_134m() {
+        // The actual [65536, 2048] activation (134M elems). Reference is the
+        // generic O(n*rank) loop's mapping; both must agree byte-for-byte.
+        assert!(run(UINT8, 65536, 2048, 8));
+    }
 }
