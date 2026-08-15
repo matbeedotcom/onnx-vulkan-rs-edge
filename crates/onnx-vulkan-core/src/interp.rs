@@ -632,6 +632,11 @@ fn matmul_nbits_q4(env: &mut Env, node: &NodeIr) -> Result<()> {
             .map(|v| v == "scalar")
             .unwrap_or(false);
         let use_splitk = !force_scalar && m == 1 && k.is_multiple_of(32);
+        // Env-gated shape dump for kernel design: prints the (m,n,k) of every
+        // MatMulNBits dispatch so the prefill (m>1) geometry can be profiled.
+        if std::env::var("LFM25_NBITS_SHAPES").is_ok() {
+            eprintln!("[nbits] m={m} n={n} k={k} splitk={use_splitk}");
+        }
         // Wave width for the matmul pipeline, chosen at startup from device
         // capabilities (ctx.matmul_wave_size): 32 on Van Gogh (device default
         // 64) because the shaders are laid out for 32-wide waves, None where
