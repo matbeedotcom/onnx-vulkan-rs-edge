@@ -80,6 +80,28 @@ pub fn gpu_time_total() -> u64 {
     }
 }
 
+/// Copies the accumulated per-op GPU time (op -> (ns, dispatch count)) without
+/// clearing it. Pair with [`reset_gpu_time`] to bracket a stretch of work.
+pub fn snapshot_gpu() -> HashMap<&'static str, (u64, u64)> {
+    match GPU_TIME.lock() {
+        Ok(g) => g.clone().unwrap_or_default(),
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// Clears the accumulated per-op GPU time (the `dump_and_reset` counterpart
+/// for harnesses that want to bracket one graph run: reset before, dump after).
+pub fn reset_gpu_time() {
+    if !enabled() {
+        return;
+    }
+    *GPU_TIME.lock().unwrap() = None;
+    FLUSH_WALL_NS.store(0, Ordering::Relaxed);
+    FLUSHES.store(0, Ordering::Relaxed);
+    UP_BYTES.store(0, Ordering::Relaxed);
+    DOWN_BYTES.store(0, Ordering::Relaxed);
+}
+
 pub fn record_flush(wall_ns: u64) {
     FLUSH_WALL_NS.fetch_add(wall_ns, Ordering::Relaxed);
     FLUSHES.fetch_add(1, Ordering::Relaxed);

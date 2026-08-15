@@ -185,6 +185,51 @@ pub fn persist_pipeline_cache() {
     }
 }
 
+/// Waits for every in-flight submission to complete and reports the per-op
+/// GPU time accumulated since the previous call (or process start). No-op
+/// outside `VULKAN_EP_STATS=1`: the timestamps backing the numbers are only
+/// recorded when that is set.
+///
+/// No `Session` handle is needed — `VkContext` is a process global — so a
+/// multi-graph harness can drain+label between graph runs to attribute GPU
+/// time to decoder / depthformer / detokenizer (this is what the LFM2.5
+/// parity binary does with `LFM25_GPU_LABEL`).
+pub fn drain_gpu_stats(label: &str) {
+    if !vk_compute::stats::enabled() {
+        return;
+    }
+    let Ok(ctx) = context() else {
+        return;
+    };
+    let wall_start = std::time::Instant::now();
+    if let Ok(()) = ctx.finish_stream() {
+        let mut total: Vec<(&str, u64, u64)> = {
+            let map = vk_compute::stats::snapshot_gpu();
+            vk_compute::stats::reset_gpu_time();
+            map.into_iter()
+                .map(|(op, (ns, n))| (op, ns, n))
+                .collect()
+        };
+        total.sort_by_key(|r| std::cmp::Reverse(r.1));
+        let gpu_sum: u64 = total.iter().map(|r| r.1).sum();
+        let wall = wall_start.elapsed().as_millis();
+        eprintln!(
+            "[gpu] {label} wall={wall}ms gpu_sum={}ms ops:",
+            gpu_sum as f64 / 1e6
+        );
+        for (op, ns, n) in total.iter().take(8) {
+            eprintln!(
+                "    {:<24} {:>9.3}ms {:>5.1}%  ({}x, {:.1}us/op)",
+                op,
+                *ns as f64 / 1e6,
+                if gpu_sum > 0 { *ns as f64 / gpu_sum as f64 * 100.0 } else { 0.0 },
+                n,
+                *ns as f64 / (*n).max(1) as f64 / 1e3
+            );
+        }
+    }
+}
+
 /// A model loaded onto the GPU, ready to run any number of times.
 pub struct Session {
     executor: Executor<'static>,

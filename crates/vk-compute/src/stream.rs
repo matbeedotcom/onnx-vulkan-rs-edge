@@ -93,6 +93,12 @@ struct Submission {
     /// Dispatch sequence the command buffer ended at: the submission covers
     /// global dispatches `[start, dispatch_end)`. Trace-only.
     dispatch_end: usize,
+    /// Profiling (VULKAN_EP_STATS=1): the command buffer's timestamp query
+    /// pool and the op type recorded for each of its dispatches. `None` when
+    /// profiling is off. The pool lives exactly as long as the submission, so
+    /// it can be destroyed in `wait_and_reap` with no in-flight hazard.
+    query_pool: Option<vk::QueryPool>,
+    ts_ops: Vec<&'static str>,
 }
 
 #[derive(Default)]
@@ -106,6 +112,16 @@ pub(crate) struct StreamState {
     /// carried here and moved into the submission `flush()` creates.
     pending_deferred: Vec<Deferred>,
     pending: Vec<Submission>,
+    /// Profiling (VULKAN_EP_STATS=1): the timestamp query pool of the OPEN
+    /// command buffer, created in `ensure_buffer`. `None` when profiling is
+    /// off or no buffer is open.
+    open_query_pool: Option<vk::QueryPool>,
+    /// Next free slot in `open_query_pool` (also the count of written slots:
+    /// slot 0 is the buffer-start marker, then one slot after each dispatch).
+    open_query_slots: u32,
+    /// Op type recorded for each dispatch of the open buffer, index-aligned
+    /// with timestamp slots 1.. (slot `i+1` minus slot `i` = dispatch `i`).
+    open_ts_ops: Vec<&'static str>,
 }
 
 impl StreamState {
@@ -164,6 +180,33 @@ impl VkContext {
             }
             stream.buffer.push(cmd);
             stream.open = true;
+            // Profiling: one timestamp query pool per command buffer. Slot 0
+            // marks the buffer start; `stream_dispatch_slices` appends one slot
+            // after every dispatch. The pool lives exactly as long as the
+            // submission, so `wait_and_reap` can read it after the fence.
+            if crate::stats::enabled() && self.timestamp_period > 0.0 {
+                let capacity = max_dispatches_per_submit() as u32 + 2;
+                let pool = unsafe {
+                    self.device
+                        .create_query_pool(
+                            &vk::QueryPoolCreateInfo::default()
+                                .query_type(vk::QueryType::TIMESTAMP)
+                                .query_count(capacity),
+                            None,
+                        )
+                }?;
+                unsafe {
+                    self.device.cmd_write_timestamp(
+                        cmd,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        pool,
+                        0,
+                    );
+                }
+                stream.open_query_pool = Some(pool);
+                stream.open_query_slots = 1;
+                stream.open_ts_ops.clear();
+            }
         }
         Ok(*stream.buffer.last().unwrap())
     }
@@ -257,6 +300,18 @@ impl VkContext {
                 vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
             );
             self.record_dispatch(cmd, pipeline, buffers, push_constants, groups)?;
+            // Profiling: the barrier before the dispatch guarantees all earlier
+            // commands are done, and the timestamp AFTER it brackets exactly
+            // this dispatch. Slot i = time before dispatch i; slot i+1 - slot
+            // i = dispatch i's GPU time (read in `wait_and_reap`).
+            if let Some(pool) = stream.open_query_pool {
+                unsafe {
+                    self.device
+                        .cmd_write_timestamp(cmd, vk::PipelineStageFlags::ALL_COMMANDS, pool, stream.open_query_slots);
+                }
+                stream.open_query_slots += 1;
+                stream.open_ts_ops.push(crate::stats::current_op());
+            }
             stream.pending_dispatches += 1;
             crate::trace::record_dispatch();
             stream.pending_dispatches >= max_dispatches_per_submit()
@@ -385,11 +440,15 @@ impl VkContext {
             );
         }
         let mut on_complete: Vec<Deferred> = std::mem::take(&mut stream.pending_deferred);
+        let query_pool = stream.open_query_pool.take();
+        let ts_ops = std::mem::take(&mut stream.open_ts_ops);
         stream.pending.push(Submission {
             command_buffer: cmd,
             fence,
             on_complete,
             dispatch_end: crate::trace::dispatch_seq(),
+            query_pool,
+            ts_ops,
         });
         result?;
         Ok(())
@@ -441,6 +500,8 @@ impl VkContext {
         let fence = sub.fence;
         let cmd = sub.command_buffer;
         let dispatch_end = sub.dispatch_end;
+        let query_pool = sub.query_pool;
+        let ts_ops = sub.ts_ops;
         let t_wait = std::time::Instant::now();
         unsafe {
             self.device
@@ -454,7 +515,51 @@ impl VkContext {
                 t_wait.elapsed().as_millis()
             );
         }
-        self.run_completion(sub)?;
+        // Profiling: the fence guarantees every timestamp write in this
+        // submission has landed, so the pool can be read and destroyed now.
+        // Slot i is the GPU time after dispatch i (slot 0 = buffer start), so
+        // dispatch i's duration is slot[i+1] - slot[i].
+        if let Some(pool) = query_pool {
+            let slots = ts_ops.len();
+            if slots > 0 {
+                let mut data = vec![0u32; slots + 1];
+                let status = unsafe {
+                    self.device.get_query_pool_results(
+                        pool,
+                        0,
+                        &mut data,
+                        vk::QueryResultFlags::empty(),
+                    )
+                };
+                // The fence was waited above, so every timestamp in this
+                // submission has landed; NOT_READY here would be a bug, not a
+                // transient state.
+                if status.is_ok() {
+                    for (i, op) in ts_ops.iter().enumerate() {
+                        // ticks -> ns: delta * period. f64 keeps sub-ns periods
+                        // intact (casting the f32 period to u32 would truncate
+                        // it to 0 on devices whose period is < 1).
+                        let ns = (data[i + 1] as f64 - data[i] as f64)
+                            * self.timestamp_period as f64;
+                        crate::stats::record_gpu(op, ns.max(0.0) as u64);
+                    }
+                }
+            }
+            unsafe {
+                self.device.destroy_query_pool(pool, None);
+            }
+        }
+        // Rebuild a Submission holding only the on_complete work (the fields
+        // moved out above were consumed), so `run_completion` still runs the
+        // deferred buffer/staging releases.
+        self.run_completion(Submission {
+            command_buffer: vk::CommandBuffer::null(),
+            fence: vk::Fence::null(),
+            on_complete: sub.on_complete,
+            dispatch_end,
+            query_pool: None,
+            ts_ops: Vec::new(),
+        })?;
         unsafe {
             self.device.destroy_fence(fence, None);
             self.device
