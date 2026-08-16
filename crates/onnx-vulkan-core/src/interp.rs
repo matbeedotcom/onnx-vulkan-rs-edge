@@ -12,7 +12,10 @@
 //! fused blocks merge and boundaries drop toward ~1.
 
 use crate::KernelCache;
-use crate::host_ops::{self, BinOp, FLOAT, HostTensor, INT8, INT32, UINT8};
+use crate::host_ops::{self, BinOp, FLOAT, HostTensor, INT64, INT8, INT32, UINT8};
+use crate::shaders::argmax::{
+    BINDINGS as ARGMAX_BINDINGS, PUSH_BYTES as ARGMAX_PUSH_BYTES,
+};
 use crate::shaders::conv::{
     BINDINGS as CONV_F32_BINDINGS, BLOCKED_TILE_SIZE as CONV_BLOCKED_TILE_SIZE,
     PUSH_BYTES as CONV_F32_PUSH_BYTES, SPLIT_REDUCE as CONV_SPLIT_REDUCE,
@@ -196,6 +199,7 @@ pub fn is_implemented(op: &str) -> bool {
             | "Pow"
             | "Min"
             | "Max"
+            | "ArgMax"
     )
 }
 
@@ -286,6 +290,15 @@ pub fn is_implemented_node(node: &NodeIr) -> bool {
                     string_attr("padding_mode", "zeros").as_str(),
                     "zeros" | "border"
                 )
+        }
+        // The kernel reduces the last axis with a per-row workgroup and
+        // drops that axis (keepdims=0). `largest=0` (ArgMin) and
+        // `select_last_index` are not supported. The axis must be the last
+        // one: validated against the runtime shape in `argmax` (it is
+        // dynamic at plan time).
+        "ArgMax" => {
+            int_attr("largest", 1) == 1
+                && node.attrs.get("select_last_index").and_then(AttrValue::as_i64).unwrap_or(0) == 0
         }
         "Gelu" => matches!(string_attr("approximate", "none").as_str(), "none" | "tanh"),
         // `add`/`mul`/`min`/`max` accumulate instead of overwriting
@@ -378,11 +391,28 @@ fn execute_nodes(ir: &GraphIr, env: &mut Env<'_, '_>) -> Result<()> {
 /// that produces it to its last consumer, not until the end of the graph.
 /// Graph outputs never appear — the host reads them after execution — and
 /// neither do initializers, which are resident in VRAM and shared across runs.
+///
+/// An `If` **captures** outer values into its subgraphs (an `Identity` in the
+/// else-branch may read a value produced by an earlier step). Such a capture is
+/// a read *by the If node itself* even though the top-level reader appears
+/// earlier, so the value must outlive the last top-level reader: a unrolled
+/// depthformer keeps `step0/depth_slices` alive until `step1/If` consumes it.
 fn dead_after(ir: &GraphIr) -> Vec<Vec<&str>> {
     let mut last: HashMap<&str, usize> = HashMap::new();
     for (index, node) in ir.nodes.iter().enumerate() {
         for name in node.inputs.iter().filter(|n| !n.is_empty()) {
             last.insert(name.as_str(), index);
+        }
+        if node.op == "If" {
+            for branch in ["then_branch", "else_branch"] {
+                if let Some(graph) = node.attrs.get(branch).and_then(AttrValue::as_graph) {
+                    for sub in &graph.nodes {
+                        for name in sub.inputs.iter().filter(|n| !n.is_empty()) {
+                            last.insert(name.as_str(), index);
+                        }
+                    }
+                }
+            }
         }
     }
     for name in &ir.outputs {
@@ -489,6 +519,7 @@ fn exec_dispatch(env: &mut Env, node: &NodeIr) -> Result<()> {
         "ReduceSum" => reduce(env, node, ReduceKind::Sum),
         "ReduceMax" => reduce(env, node, ReduceKind::Max),
         "ReduceMin" => reduce(env, node, ReduceKind::Min),
+        "ArgMax" => argmax(env, node),
         "Flatten" => flatten(env, node),
         "LeakyRelu" => leaky_relu(env, node),
         "CumSum" => cumsum(env, node),
@@ -743,6 +774,7 @@ fn matmul_nbits_q4(env: &mut Env, node: &NodeIr) -> Result<()> {
                     let wbytes = n * k2;
                     let sbytes = n * blocks * 4;
                     let wkey = (format!("kmajor::{}", node.inputs[1]), UINT8, wbytes);
+                    let wname = node.inputs[1].to_string();
                     let wptr = env.cache().transposed_initializer(wkey, || {
                         // Full byte-matrix transpose [n][k/2] -> [k/2][n]:
                         // dst[b][c] = src[c][b]. The 32 col-lanes of a
@@ -750,40 +782,68 @@ fn matmul_nbits_q4(env: &mut Env, node: &NodeIr) -> Result<()> {
                         // consecutive bytes. Bit-identical: a pure reorder of
                         // constant bytes; the kernel reads the same (c, kk)
                         // byte either way.
-                        let mut outb = vec![0u8; wbytes];
-                        for b in 0..k2 {
-                            let dst = b * n;
-                            for c in 0..n {
-                                let src = c * k2 + b;
-                                outb[dst + c] = winit.data[src];
+                        //
+                        // Large tensors go through the tiled host transpose
+                        // (cache-friendly): the naive per-byte scatter does one
+                        // random 64 B-line touch per byte (~64x amplification)
+                        // and cost ~23 ms per 8 MB weight (13.8 s over the
+                        // decoder set, all inside the timed first inference).
+                        // The tiled path streams contiguous rows: ~ms each.
+                        let outb = if wbytes >= 1 << 20 {
+                            let h = HostTensor::new(UINT8, vec![n as i64, k2 as i64], winit.data.clone());
+                            host_transpose(&h, &[1, 0], &[k2 as i64, n as i64])?.data
+                        } else {
+                            let mut outb = vec![0u8; wbytes];
+                            for b in 0..k2 {
+                                let dst = b * n;
+                                for c in 0..n {
+                                    let src = c * k2 + b;
+                                    outb[dst + c] = winit.data[src];
+                                }
                             }
-                        }
+                            outb
+                        };
+                        let t = std::time::Instant::now();
                         let buffer =
                             ctx.create_storage_buffer(device_storage_bytes(UINT8, wbytes)?)?;
                         ctx.stream_upload(&buffer, &outb)?;
+                        if std::env::var_os("LFM25_KMAJOR_TRACE").is_some() {
+                            eprintln!(
+                                "[kmajor] weights transpose {} n={} k2={} bytes={} host={}ms upload={}ms",
+                                wname, n, k2, wbytes, t.elapsed().as_millis(), 0
+                            );
+                        }
                         Ok(buffer)
                     })?;
                     let skey = (format!("kmscales::{}", node.inputs[2]), FLOAT, sbytes);
+                    let sname = node.inputs[2].to_string();
                     let sptr = env.cache().transposed_initializer(skey, || {
-                        // Scale transpose [n][k/32] -> [k/32][n], f32. The
-                        // colmajor kernel reads scales[col*blocks + b] with the
-                        // 32 col-lanes k/32 f32s (1 KB at k=8192) apart — one
-                        // 64 B line per lane for 4 useful bytes (16x
-                        // amplification, 256 blocks deep for k=8192). The
-                        // permuted layout makes those 32 lanes read 32
-                        // consecutive f32s. Pure reorder of constant bytes:
-                        // bit-identical.
-                        let mut outb = vec![0u8; sbytes];
-                        for b in 0..blocks {
-                            for c in 0..n {
-                                let dst = (b * n + c) * 4;
-                                let src = (c * blocks + b) * 4;
-                                outb[dst..dst + 4].copy_from_slice(&sinit.data[src..src + 4]);
+                        // Scale transpose [n][k/32] -> [k/32][n], f32. Tiled
+                        // for the big weights (see the weights path above).
+                        let outb = if sbytes >= 1 << 20 {
+                            let h = HostTensor::new(FLOAT, vec![n as i64, blocks as i64], sinit.data.clone());
+                            host_transpose(&h, &[1, 0], &[blocks as i64, n as i64])?.data
+                        } else {
+                            let mut outb = vec![0u8; sbytes];
+                            for b in 0..blocks {
+                                for c in 0..n {
+                                    let dst = (b * n + c) * 4;
+                                    let src = (c * blocks + b) * 4;
+                                    outb[dst..dst + 4].copy_from_slice(&sinit.data[src..src + 4]);
+                                }
                             }
-                        }
+                            outb
+                        };
+                        let t = std::time::Instant::now();
                         let buffer =
                             ctx.create_storage_buffer(device_storage_bytes(FLOAT, sbytes / 4)?)?;
                         ctx.stream_upload(&buffer, &outb)?;
+                        if std::env::var_os("LFM25_KMAJOR_TRACE").is_some() {
+                            eprintln!(
+                                "[kmajor] scales transpose {} n={} blocks={} bytes={} host={}ms upload={}ms",
+                                sname, n, blocks, sbytes, t.elapsed().as_millis(), 0
+                            );
+                        }
                         Ok(buffer)
                     })?;
                     Some((unsafe { &*wptr }, unsafe { &*sptr }))
@@ -4804,6 +4864,76 @@ fn reduce(env: &mut Env, node: &NodeIr, kind: ReduceKind) -> Result<()> {
         &node.outputs[0],
         Tensor::Device(DevTensor {
             dtype: FLOAT,
+            shape: out_shape,
+            elem_count: rows,
+            buf: BufRef::Owned(out),
+        }),
+    );
+    Ok(())
+}
+
+/// `ArgMax` (last axis, keepdims=0, largest=1): per-row index of the maximum.
+/// Device kernel (one 256-thread workgroup per row: strided scan + LDS tree).
+/// Output is i64, in VRAM, so the unrolled depthformer's 8 chained argmaxes
+/// never leave the GPU. Input must be f32 (all LFM2.5 argmaxes operate on
+/// float logits).
+fn argmax(env: &mut Env, node: &NodeIr) -> Result<()> {
+    let x_name = node.inputs[0].clone();
+    let x_shape = env.shape_of(&x_name)?;
+    let rank = x_shape.len();
+    ensure!(rank >= 1, "ArgMax: input is scalar");
+    let axis = node
+        .attrs
+        .get("axis")
+        .and_then(AttrValue::as_i64)
+        .unwrap_or(-1);
+    let axis = if axis < 0 { axis + rank as i64 } else { axis };
+    let keepdims = node
+        .attrs
+        .get("keepdims")
+        .and_then(AttrValue::as_i64)
+        .unwrap_or(1)
+        != 0;
+    ensure!(
+        axis as usize == rank - 1 && !keepdims,
+        "ArgMax: only last-axis (axis={axis}) with keepdims=0 is supported"
+    );
+    ensure!(
+        env.dtype_of(&x_name)? == FLOAT,
+        "ArgMax: f32 input required (got non-float)"
+    );
+
+    let ctx = env.context();
+    env.ensure_device(&x_name)?;
+    let x = env.device(&x_name)?;
+    let c = x_shape[rank - 1] as usize; // reduced (last) axis
+    let rows = x.elem_count / c.max(1);
+
+    let out = ctx.create_storage_buffer(device_storage_bytes(INT64, rows)?)?;
+    if rows > 0 {
+        // One workgroup per row (256 threads scan the row cooperatively).
+        let wg_x = (rows as u32).clamp(1, 65535);
+        let gy = (rows as u32).div_ceil(65535);
+        let mut push = Vec::with_capacity(ARGMAX_PUSH_BYTES as usize);
+        for v in [c as u32, 1u32, rows as u32, wg_x] {
+            push.extend_from_slice(&v.to_le_bytes());
+        }
+        with_pipeline(
+            env.cache(),
+            "ArgMax",
+            || {
+                let src = crate::shaders::argmax::ARGMAX;
+                ctx.create_pipeline(&compile_wgsl(src)?, ARGMAX_BINDINGS, ARGMAX_PUSH_BYTES)
+            },
+            |pipe| ctx.stream_dispatch(pipe, &[x.buffer(), &out], &push, [wg_x, gy, 1]),
+        )?;
+    }
+    let mut out_shape = x_shape.clone();
+    out_shape.pop();
+    env.set(
+        &node.outputs[0],
+        Tensor::Device(DevTensor {
+            dtype: INT64,
             shape: out_shape,
             elem_count: rows,
             buf: BufRef::Owned(out),

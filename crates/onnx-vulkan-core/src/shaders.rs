@@ -1,5 +1,6 @@
 //! Sorgenti WGSL condivise da executor standalone e adattatori backend.
 
+pub mod argmax;
 pub mod conv;
 pub mod conv_integer;
 pub mod conv_transpose;
