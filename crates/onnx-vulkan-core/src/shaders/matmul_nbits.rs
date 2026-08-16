@@ -131,8 +131,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 ///
 /// `MATMUL_NBITS_Q4_TILED` launches one thread per output element, each
 /// running the full K reduction serially. For the decode step (m == 1) that is
-/// only ~n threads for a 10-CU RDNA2, and even prefill (m == 31) leaves a
-/// long dependent-FMA chain per thread. This kernel instead has a
+/// only ~n threads for the deck's 8-CU Van Gogh, and even prefill (m == 31)
+/// leaves a long dependent-FMA chain per thread. This kernel instead has a
 /// 32-column × 8-k-lane workgroup (256 threads): lane `kl` reduces a
 /// contiguous 1/8 slice of K, the per-column partials meet in shared memory,
 /// and the 8 slices are summed in a fixed order. `gid.x` selects the output
@@ -229,7 +229,7 @@ fn main(
 /// GEMV (e.g. m=1 n=2048 k=8192).
 ///
 /// The intra-workgroup split-K kernel above launches `ceil(n/32)` workgroups;
-/// for small `n` that is far too few to fill Vangogh's 20 CUs, so each one
+/// for small `n` that is far too few to fill Van Gogh's 8 CUs, so each one
 /// carries a long dependent K chain and the op is latency-bound (n=2048,
 /// k=8192 measured at 331 ms/op — ~12000x off the memory peak). This kernel
 /// adds a `k_chunks` grid dimension: workgroup `(row, chunk, coltile)` reduces

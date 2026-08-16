@@ -652,33 +652,40 @@ fn matmul_nbits_q4(env: &mut Env, node: &NodeIr) -> Result<()> {
         let use_splitk = !force_scalar
             && (splitk_max_m == 0 || m as u32 <= splitk_max_m)
             && k.is_multiple_of(32);
-        // Inter-workgroup split-K (two-pass) for the m==1 decode GEMVs.
-        // Single-pass launches n/32 workgroups; for small n that under-fills
-        // the CUs and each workgroup's (8-way intra) K chain is long, so the
-        // op is latency-bound (n=2048, k=8192 = 331 ms/op). Splitting K across
-        // k_chunks workgroups multiplies occupancy by k_chunks and shortens
-        // the chain by the same factor; a second pass sums the partials in
-        // fixed chunk order (deterministic).
+        // Inter-workgroup split-K (two-pass) for under-occupied / long-chain
+        // Q4 shapes. Single-pass launches n/32 workgroups PER ROW; with the
+        // deck's 8 CUs (a 256-thread workgroup = 8 waves = one full CU, so at
+        // most 8 are in flight) each workgroup's 8-way intra K chain is long
+        // (k/8 vec4 steps per lane) and the op is latency-bound. Splitting K
+        // across k_chunks workgroups multiplies occupancy by k_chunks and
+        // shortens the chain by the same factor; a second pass sums the
+        // partials in fixed chunk order (deterministic).
         //
-        // Fixed k_chunks = 8 is the Deck-tuned default: it beats both C=4
-        // (22.8 s vs 21.4 s wall) and a per-shape "target 32 steps/lane"
-        // heuristic (23.7 s — too conservative for the k=2048 shapes, where
-        // C=8 still wins). Requires m==1 (prefill already has m*n/32
-        // workgroups), n>=256 (tiny shapes gain nothing), and (k/32)%8==0
-        // (exact chunks — never a partial). Env A/B override:
-        // LFM25_NBITS_K_CHUNKS (>=1 forces that count for m==1; 1 = off).
+        // m==1 decode: default C=8 (Deck-tuned: beats C=4 22.8->21.4 s and a
+        // per-shape heuristic 23.7 s). Override with LFM25_NBITS_K_CHUNKS.
+        // m>1 prefill: default C=1 (off). Override with LFM25_NBITS_K_CHUNKS_M
+        // — kept SEPARATE so an m>1 sweep does not also retune the m==1 decode
+        // path (a global one env would clobber the tuned C=8). The re-profile
+        // of the shipped state showed the prefill m=31 shapes carry the same
+        // long dependent K chains (m=31 n=8192 k=2048 = 108 ms/op at ~10
+        // GFLOP/s effective), so deep is now A/B-able for prefill too. Both
+        // require n>=256 and (k/32)%C==0 (exact chunks — never a partial).
+        let env_chunks_m1: Option<u32> = std::env::var("LFM25_NBITS_K_CHUNKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&c| c >= 1);
+        let env_chunks_mm: Option<u32> = std::env::var("LFM25_NBITS_K_CHUNKS_M")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&c| c >= 1);
         let k_chunks: u32 = if m == 1 {
-            std::env::var("LFM25_NBITS_K_CHUNKS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .filter(|&c| c >= 1)
-                .unwrap_or(8)
+            env_chunks_m1.unwrap_or(8)
         } else {
-            1
+            env_chunks_mm.unwrap_or(1)
         };
         let use_deep = use_splitk
             && k_chunks > 1
-            && m == 1
+            && (m == 1 || env_chunks_mm.is_some())
             && (n as u32) >= 256
             && ((k / 32) as u32) % k_chunks == 0;
         // Small-M tiled GEMM for prefill (m>1): stage a BM=4 x BK=32 dequantized
