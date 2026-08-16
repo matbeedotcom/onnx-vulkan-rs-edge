@@ -729,20 +729,28 @@ fn matmul_nbits_q4(env: &mut Env, node: &NodeIr) -> Result<()> {
             && std::env::var("LFM25_NBITS_KMAJOR")
                 .map(|v| v != "0")
                 .unwrap_or(true);
-        let w_kmajor: Option<&GpuBuffer> = if kmajor_active {
-            match env.initializer(node.inputs[1].as_str()) {
-                Some(winit) if winit.dtype == UINT8 => {
+        // (permuted [k/2][n] weights, permuted [k/32][n] scales) for the
+        // kmajor kernels; None -> colmajor fallback (the two are always used
+        // together, so a scales that can't be permuted also disables weights).
+        let kmajor_bufs: Option<(&GpuBuffer, &GpuBuffer)> = if kmajor_active {
+            match (
+                env.initializer(node.inputs[1].as_str()),
+                env.initializer(node.inputs[2].as_str()),
+            ) {
+                (Some(winit), Some(sinit)) if winit.dtype == UINT8 && sinit.dtype == FLOAT => {
                     let k2 = k / 2;
-                    let bytes = n * k2;
-                    let key = (format!("kmajor::{}", node.inputs[1]), UINT8, bytes);
-                    let ptr = env.cache().transposed_initializer(key, || {
-                        // Full byte-matrix transpose [n][k/2] -> [k/2][n].
-                        //   dst[b][c] = src[c][b]   (b in 0..k/2, c in 0..n)
-                        // so the 32 col-lanes of a workgroup (c = tile*32..+32,
-                        // fixed b) read 32 consecutive bytes. Bit-identical: a
-                        // pure reorder of constant bytes; the kernel reads the
-                        // same (c, kk) byte either way.
-                        let mut outb = vec![0u8; bytes];
+                    let blocks = k / 32;
+                    let wbytes = n * k2;
+                    let sbytes = n * blocks * 4;
+                    let wkey = (format!("kmajor::{}", node.inputs[1]), UINT8, wbytes);
+                    let wptr = env.cache().transposed_initializer(wkey, || {
+                        // Full byte-matrix transpose [n][k/2] -> [k/2][n]:
+                        // dst[b][c] = src[c][b]. The 32 col-lanes of a
+                        // workgroup (c = tile*32..+32, fixed b) read 32
+                        // consecutive bytes. Bit-identical: a pure reorder of
+                        // constant bytes; the kernel reads the same (c, kk)
+                        // byte either way.
+                        let mut outb = vec![0u8; wbytes];
                         for b in 0..k2 {
                             let dst = b * n;
                             for c in 0..n {
@@ -751,24 +759,48 @@ fn matmul_nbits_q4(env: &mut Env, node: &NodeIr) -> Result<()> {
                             }
                         }
                         let buffer =
-                            ctx.create_storage_buffer(device_storage_bytes(UINT8, bytes)?)?;
+                            ctx.create_storage_buffer(device_storage_bytes(UINT8, wbytes)?)?;
                         ctx.stream_upload(&buffer, &outb)?;
                         Ok(buffer)
                     })?;
-                    Some(unsafe { &*ptr })
+                    let skey = (format!("kmscales::{}", node.inputs[2]), FLOAT, sbytes);
+                    let sptr = env.cache().transposed_initializer(skey, || {
+                        // Scale transpose [n][k/32] -> [k/32][n], f32. The
+                        // colmajor kernel reads scales[col*blocks + b] with the
+                        // 32 col-lanes k/32 f32s (1 KB at k=8192) apart — one
+                        // 64 B line per lane for 4 useful bytes (16x
+                        // amplification, 256 blocks deep for k=8192). The
+                        // permuted layout makes those 32 lanes read 32
+                        // consecutive f32s. Pure reorder of constant bytes:
+                        // bit-identical.
+                        let mut outb = vec![0u8; sbytes];
+                        for b in 0..blocks {
+                            for c in 0..n {
+                                let dst = (b * n + c) * 4;
+                                let src = (c * blocks + b) * 4;
+                                outb[dst..dst + 4].copy_from_slice(&sinit.data[src..src + 4]);
+                            }
+                        }
+                        let buffer =
+                            ctx.create_storage_buffer(device_storage_bytes(FLOAT, sbytes / 4)?)?;
+                        ctx.stream_upload(&buffer, &outb)?;
+                        Ok(buffer)
+                    })?;
+                    Some((unsafe { &*wptr }, unsafe { &*sptr }))
                 }
                 _ => None,
             }
         } else {
             None
         };
-        let wbuf = w_kmajor.unwrap_or_else(|| w.buffer());
+        let wbuf = kmajor_bufs.map(|b| b.0).unwrap_or_else(|| w.buffer());
+        let sbuf = kmajor_bufs.map(|b| b.1).unwrap_or_else(|| scales.buffer());
         // Env-gated shape dump for kernel design: prints the (m,n,k) of every
         // MatMulNBits dispatch so the prefill (m>1) geometry can be profiled.
         if std::env::var("LFM25_NBITS_SHAPES").is_ok() {
             eprintln!(
                 "[nbits] m={m} n={n} k={k} splitk={use_splitk} deep={use_deep} k_chunks={k_chunks} kmajor={}",
-                w_kmajor.is_some()
+                kmajor_bufs.is_some()
             );
         }
         // Wave width for the matmul pipeline, chosen at startup from device
@@ -796,7 +828,7 @@ fn matmul_nbits_q4(env: &mut Env, node: &NodeIr) -> Result<()> {
             // separately below and never reaches this selection.)
             // Km major variant: same grid/push; the pipeline key differs so the
             // colmajor and kmajor pipelines coexist in the cache.
-            if w_kmajor.is_some() {
+            if kmajor_bufs.is_some() {
                 ("MatMulNBitsQ4_SplitK_Kmajor", MATMUL_NBITS_Q4_SPLITK_KMAJOR)
             } else {
                 ("MatMulNBitsQ4_SplitK", MATMUL_NBITS_Q4_SPLITK)
@@ -831,13 +863,13 @@ fn matmul_nbits_q4(env: &mut Env, node: &NodeIr) -> Result<()> {
                 .try_into()
                 .context("MatMulNBits: partial overflow")?;
             let partial = ctx.create_storage_buffer(device_storage_bytes(FLOAT, partial_elems)?)?;
-            let deep_key = format!("MatMulNBitsQ4_SplitK_Deep{wave_key}{}", if w_kmajor.is_some() { "Km" } else { "" });
+            let deep_key = format!("MatMulNBitsQ4_SplitK_Deep{wave_key}{}", if kmajor_bufs.is_some() { "Km" } else { "" });
             let reduce_key = format!("MatMulNBitsQ4_SplitK_Reduce{wave_key}");
             let mut deep_push = Vec::with_capacity(MMNB_DEEP_PUSH_BYTES as usize);
             for value in [m as u32, k as u32, n as u32, k_chunks] {
                 deep_push.extend_from_slice(&value.to_le_bytes());
             }
-            let deep_src = if w_kmajor.is_some() {
+            let deep_src = if kmajor_bufs.is_some() {
                 MATMUL_NBITS_Q4_SPLITK_DEEP_KMAJOR
             } else {
                 MATMUL_NBITS_Q4_SPLITK_DEEP
@@ -853,7 +885,7 @@ fn matmul_nbits_q4(env: &mut Env, node: &NodeIr) -> Result<()> {
             let pipeline = unsafe { &*pipeline };
             ctx.stream_dispatch(
                 pipeline,
-                &[a.buffer(), wbuf, scales.buffer(), &partial],
+                &[a.buffer(), wbuf, sbuf, &partial],
                 &deep_push,
                 [m as u32, k_chunks, (n as u32).div_ceil(32)],
             )?;
@@ -906,7 +938,7 @@ fn matmul_nbits_q4(env: &mut Env, node: &NodeIr) -> Result<()> {
             };
             ctx.stream_dispatch(
                 pipeline,
-                &[a.buffer(), wbuf, scales.buffer(), &out],
+                &[a.buffer(), wbuf, sbuf, &out],
                 &push,
                 grid,
             )?;

@@ -370,7 +370,12 @@ var<immediate> pc: Params;
 
 @group(0) @binding(0) var<storage, read> a: array<f32>;
 @group(0) @binding(1) var<storage, read> packed_w: array<u32>;
-@group(0) @binding(2) var<storage, read> scales: array<f32>;
+// scales_km: block scales PERMUTED to [k/32][n] (load-time, kernel cache). A
+// wave's 32 col-lanes read 32 CONSECUTIVE f32s (one coalesced line) instead of
+// 32 f32s k/32*4 B apart (1 KB stride at k=8192 = 16x sector amplification,
+// the second column-major static stream after the weights). Pure reorder of
+// constant bytes: bit-identical to reading scales[col*blocks + b].
+@group(0) @binding(2) var<storage, read> scales_km: array<f32>;
 @group(0) @binding(3) var<storage, read_write> y: array<f32>;
 
 const COLS: u32 = 32u;
@@ -393,7 +398,6 @@ fn main(
     let row = wid.x;
     let col = wid.z * COLS + col_lane;
     let valid = col < pc.n;
-    let blocks = pc.k / 32u;
     let k_chunk = pc.k / KL;
     let k_start = k_lane * k_chunk;
     let n = pc.n;
@@ -408,10 +412,12 @@ fn main(
             let q1 = select(ba & 0x0fu, ba >> 4u, ((kk + 1u) & 1u) != 0u);
             let q2 = select(bb & 0x0fu, bb >> 4u, ((kk + 2u) & 1u) != 0u);
             let q3 = select(bb & 0x0fu, bb >> 4u, ((kk + 3u) & 1u) != 0u);
-            let sa0 = scales[col * blocks + kk / 32u];
-            let sa1 = scales[col * blocks + (kk + 1u) / 32u];
-            let sa2 = scales[col * blocks + (kk + 2u) / 32u];
-            let sa3 = scales[col * blocks + (kk + 3u) / 32u];
+            // scales_km [blocks][n]: (kk/32)*n + col — 32 consecutive f32s
+            // across the 32 col-lanes.
+            let sa0 = scales_km[kk / 32u * n + col];
+            let sa1 = scales_km[(kk + 1u) / 32u * n + col];
+            let sa2 = scales_km[(kk + 2u) / 32u * n + col];
+            let sa3 = scales_km[(kk + 3u) / 32u * n + col];
             let av = vec4<f32>(
                 a[row * pc.k + kk],
                 a[row * pc.k + kk + 1u],
@@ -450,7 +456,9 @@ var<immediate> pc: Params;
 
 @group(0) @binding(0) var<storage, read> a: array<f32>;
 @group(0) @binding(1) var<storage, read> packed_w: array<u32>;
-@group(0) @binding(2) var<storage, read> scales: array<f32>;
+// scales_km: block scales PERMUTED to [k/32][n] (load-time, kernel cache);
+// see MATMUL_NBITS_Q4_SPLITK_KMAJOR. 32 consecutive f32s per wave.
+@group(0) @binding(2) var<storage, read> scales_km: array<f32>;
 @group(0) @binding(3) var<storage, read_write> partial: array<f32>;
 
 const COLS: u32 = 32u;
@@ -474,7 +482,6 @@ fn main(
     let chunk = wid.y;
     let col = wid.z * COLS + col_lane;
     let valid = col < pc.n;
-    let blocks = pc.k / 32u;
     let slice = pc.k / pc.k_chunks;
     let lane_span = slice / KL;
     let k_start = chunk * slice + k_lane * lane_span;
@@ -490,10 +497,10 @@ fn main(
             let q1 = select(ba & 0x0fu, ba >> 4u, ((kk + 1u) & 1u) != 0u);
             let q2 = select(bb & 0x0fu, bb >> 4u, ((kk + 2u) & 1u) != 0u);
             let q3 = select(bb & 0x0fu, bb >> 4u, ((kk + 3u) & 1u) != 0u);
-            let sa0 = scales[col * blocks + kk / 32u];
-            let sa1 = scales[col * blocks + (kk + 1u) / 32u];
-            let sa2 = scales[col * blocks + (kk + 2u) / 32u];
-            let sa3 = scales[col * blocks + (kk + 3u) / 32u];
+            let sa0 = scales_km[kk / 32u * n + col];
+            let sa1 = scales_km[(kk + 1u) / 32u * n + col];
+            let sa2 = scales_km[(kk + 2u) / 32u * n + col];
+            let sa3 = scales_km[(kk + 3u) / 32u * n + col];
             let av = vec4<f32>(
                 a[row * pc.k + kk],
                 a[row * pc.k + kk + 1u],
