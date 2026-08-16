@@ -66,7 +66,8 @@ use crate::shaders::matmul_integer::{
 };
 use crate::shaders::matmul_nbits::{
     BINDINGS as MMNB_BINDINGS, MATMUL_NBITS_Q4, MATMUL_NBITS_Q4_SPLITK,
-    MATMUL_NBITS_Q4_SPLITK_DEEP, MATMUL_NBITS_Q4_SPLITK_REDUCE, MATMUL_NBITS_Q4_TILED,
+    MATMUL_NBITS_Q4_SPLITK_DEEP, MATMUL_NBITS_Q4_SPLITK_DEEP_KMAJOR,
+    MATMUL_NBITS_Q4_SPLITK_KMAJOR, MATMUL_NBITS_Q4_SPLITK_REDUCE, MATMUL_NBITS_Q4_TILED,
     MATMUL_NBITS_Q4_TILED_SMALL_M, PUSH_BYTES as MMNB_PUSH_BYTES,
     SPLITK_DEEP_BINDINGS as MMNB_DEEP_BINDINGS, SPLITK_DEEP_PUSH_BYTES as MMNB_DEEP_PUSH_BYTES,
     SPLITK_REDUCE_BINDINGS as MMNB_RED_BINDINGS, TILED_SMALL_M_BM as MMNB_SM_BM,
@@ -700,11 +701,74 @@ fn matmul_nbits_q4(env: &mut Env, node: &NodeIr) -> Result<()> {
             && std::env::var("LFM25_NBITS_SMALL_M")
                 .map(|v| v == "1")
                 .unwrap_or(false);
+        // K-major weight layout. ON by default (Deck A/B 2026-08-16: 21.4 s
+        // -> 15.5 s, audio byte-identical, zero fatal, no VRAM pressure).
+        // Disable with LFM25_NBITS_KMAJOR=0 to fall back to the ONNX colmajor
+        // [n][k/2] export layout.
+        //
+        // The ONNX export packs weights `[n][k/2]`: byte of column c, k-index
+        // kk is at c*(k/2) + kk/2. The split-K kernels have 32 col-lanes per
+        // workgroup reading, at one k-iteration, 32 bytes (k/2) apart — each
+        // lane pulls its own 64 B cache line for 2 useful bytes (sector
+        // amplification; the m=31 op runs ~1000x above the HBM floor). A
+        // load-time permutation to `[k/2][n]` makes those 32 lanes read 32
+        // CONSECUTIVE bytes (one coalesced line) for the SAME math: it is a
+        // pure reorder of constant bytes, so results are bit-identical (Gate A
+        // worstNrmse identical; Deck wav md5 identical). The permutation is a
+        // full [n][k/2] -> [k/2][n] byte-matrix transpose, done ONCE into the
+        // kernel cache (the weight is an initializer), never per dispatch.
+        // Scales keep their ONNX `[n][k/32]` order (already line-aligned).
+        //
+        // Available only when the split-K kernel family is selected (kmajor
+        // variants exist for SPLITK and SPLITK_DEEP; Tiled/SM/naive stay
+        // colmajor) AND the packed weights are an initializer (per-run
+        // weights can't be permuted once). Otherwise: colmajor, unchanged.
+        let kmajor_active = use_splitk
+            && !force_scalar
+            && !use_small_m
+            && std::env::var("LFM25_NBITS_KMAJOR")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+        let w_kmajor: Option<&GpuBuffer> = if kmajor_active {
+            match env.initializer(node.inputs[1].as_str()) {
+                Some(winit) if winit.dtype == UINT8 => {
+                    let k2 = k / 2;
+                    let bytes = n * k2;
+                    let key = (format!("kmajor::{}", node.inputs[1]), UINT8, bytes);
+                    let ptr = env.cache().transposed_initializer(key, || {
+                        // Full byte-matrix transpose [n][k/2] -> [k/2][n].
+                        //   dst[b][c] = src[c][b]   (b in 0..k/2, c in 0..n)
+                        // so the 32 col-lanes of a workgroup (c = tile*32..+32,
+                        // fixed b) read 32 consecutive bytes. Bit-identical: a
+                        // pure reorder of constant bytes; the kernel reads the
+                        // same (c, kk) byte either way.
+                        let mut outb = vec![0u8; bytes];
+                        for b in 0..k2 {
+                            let dst = b * n;
+                            for c in 0..n {
+                                let src = c * k2 + b;
+                                outb[dst + c] = winit.data[src];
+                            }
+                        }
+                        let buffer =
+                            ctx.create_storage_buffer(device_storage_bytes(UINT8, bytes)?)?;
+                        ctx.stream_upload(&buffer, &outb)?;
+                        Ok(buffer)
+                    })?;
+                    Some(unsafe { &*ptr })
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let wbuf = w_kmajor.unwrap_or_else(|| w.buffer());
         // Env-gated shape dump for kernel design: prints the (m,n,k) of every
         // MatMulNBits dispatch so the prefill (m>1) geometry can be profiled.
         if std::env::var("LFM25_NBITS_SHAPES").is_ok() {
             eprintln!(
-                "[nbits] m={m} n={n} k={k} splitk={use_splitk} deep={use_deep} k_chunks={k_chunks}"
+                "[nbits] m={m} n={n} k={k} splitk={use_splitk} deep={use_deep} k_chunks={k_chunks} kmajor={}",
+                w_kmajor.is_some()
             );
         }
         // Wave width for the matmul pipeline, chosen at startup from device
@@ -730,7 +794,13 @@ fn matmul_nbits_q4(env: &mut Env, node: &NodeIr) -> Result<()> {
         } else if use_splitk {
             // m==1 (non-deep) and m>1 split-K. (m==1 with use_deep is dispatched
             // separately below and never reaches this selection.)
-            ("MatMulNBitsQ4_SplitK", MATMUL_NBITS_Q4_SPLITK)
+            // Km major variant: same grid/push; the pipeline key differs so the
+            // colmajor and kmajor pipelines coexist in the cache.
+            if w_kmajor.is_some() {
+                ("MatMulNBitsQ4_SplitK_Kmajor", MATMUL_NBITS_Q4_SPLITK_KMAJOR)
+            } else {
+                ("MatMulNBitsQ4_SplitK", MATMUL_NBITS_Q4_SPLITK)
+            }
         } else {
             ("MatMulNBitsQ4_Tiled", MATMUL_NBITS_Q4_TILED)
         };
@@ -761,15 +831,20 @@ fn matmul_nbits_q4(env: &mut Env, node: &NodeIr) -> Result<()> {
                 .try_into()
                 .context("MatMulNBits: partial overflow")?;
             let partial = ctx.create_storage_buffer(device_storage_bytes(FLOAT, partial_elems)?)?;
-            let deep_key = format!("MatMulNBitsQ4_SplitK_Deep{wave_key}");
+            let deep_key = format!("MatMulNBitsQ4_SplitK_Deep{wave_key}{}", if w_kmajor.is_some() { "Km" } else { "" });
             let reduce_key = format!("MatMulNBitsQ4_SplitK_Reduce{wave_key}");
             let mut deep_push = Vec::with_capacity(MMNB_DEEP_PUSH_BYTES as usize);
             for value in [m as u32, k as u32, n as u32, k_chunks] {
                 deep_push.extend_from_slice(&value.to_le_bytes());
             }
+            let deep_src = if w_kmajor.is_some() {
+                MATMUL_NBITS_Q4_SPLITK_DEEP_KMAJOR
+            } else {
+                MATMUL_NBITS_Q4_SPLITK_DEEP
+            };
             let pipeline = env.cache().pipeline(deep_key, || {
                 ctx.create_pipeline_forced(
-                    &compile_wgsl(MATMUL_NBITS_Q4_SPLITK_DEEP)?,
+                    &compile_wgsl(deep_src)?,
                     MMNB_DEEP_BINDINGS,
                     MMNB_DEEP_PUSH_BYTES,
                     forced_subgroup,
@@ -778,7 +853,7 @@ fn matmul_nbits_q4(env: &mut Env, node: &NodeIr) -> Result<()> {
             let pipeline = unsafe { &*pipeline };
             ctx.stream_dispatch(
                 pipeline,
-                &[a.buffer(), w.buffer(), scales.buffer(), &partial],
+                &[a.buffer(), wbuf, scales.buffer(), &partial],
                 &deep_push,
                 [m as u32, k_chunks, (n as u32).div_ceil(32)],
             )?;
@@ -831,7 +906,7 @@ fn matmul_nbits_q4(env: &mut Env, node: &NodeIr) -> Result<()> {
             };
             ctx.stream_dispatch(
                 pipeline,
-                &[a.buffer(), w.buffer(), scales.buffer(), &out],
+                &[a.buffer(), wbuf, scales.buffer(), &out],
                 &push,
                 grid,
             )?;

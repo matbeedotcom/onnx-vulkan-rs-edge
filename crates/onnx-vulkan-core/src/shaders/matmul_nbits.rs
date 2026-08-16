@@ -353,6 +353,176 @@ pub const SPLITK_DEEP_BINDINGS: u32 = 4;
 /// Bindings for the reduce (pass-2) kernel: partial, y.
 pub const SPLITK_REDUCE_BINDINGS: u32 = 2;
 
+/// K-major variant of `MATMUL_NBITS_Q4_SPLITK`: identical work, but the packed
+/// weights are laid out `[k/2][n]` (a row-major transpose of the ONNX
+/// `[n][k/2]` export) so the 32 col-lanes of one workgroup read 32 CONSECUTIVE
+/// bytes per k-iteration instead of 32 bytes 1024 B apart. The colmajor layout
+/// forces each of the 32 lanes to pull its own 64 B cache line for 2 useful
+/// bytes (~16-32x sector amplification, the measured prefill cost); kmajor
+/// coalesces them into one line. Scales keep the ONNX `[n][k/32]` order (their
+/// access is one f32 per (col, block) and already line-aligned).
+/// Bit-identical to the colmajor kernel: every output is the same sum of the
+/// same per-k terms in the same lane/ascending-k order; only the physical
+/// weight byte positions differ.
+pub const MATMUL_NBITS_Q4_SPLITK_KMAJOR: &str = r#"
+struct Params { m: u32, k: u32, n: u32 }
+var<immediate> pc: Params;
+
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> packed_w: array<u32>;
+@group(0) @binding(2) var<storage, read> scales: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+
+const COLS: u32 = 32u;
+const KL: u32 = 8u;
+
+var<workgroup> partial: array<f32, 256>;
+
+fn kbyte(idx: u32) -> u32 {
+    let w = packed_w[idx >> 2u];
+    return (w >> ((idx & 3u) * 8u)) & 0xffu;
+}
+
+@compute @workgroup_size(256)
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_index) tid: u32,
+) {
+    let col_lane = tid % COLS;
+    let k_lane = tid / COLS;
+    let row = wid.x;
+    let col = wid.z * COLS + col_lane;
+    let valid = col < pc.n;
+    let blocks = pc.k / 32u;
+    let k_chunk = pc.k / KL;
+    let k_start = k_lane * k_chunk;
+    let n = pc.n;
+    var sum = 0.0;
+    if (valid) {
+        var kk = k_start;
+        for (; kk + 4u <= k_start + k_chunk; kk = kk + 4u) {
+            // kmajor: byte of column `col`, k-index kk is at (kk/2)*n + col.
+            let ba = kbyte((kk / 2u) * n + col);
+            let bb = kbyte(((kk + 2u) / 2u) * n + col);
+            let q0 = select(ba & 0x0fu, ba >> 4u, (kk & 1u) != 0u);
+            let q1 = select(ba & 0x0fu, ba >> 4u, ((kk + 1u) & 1u) != 0u);
+            let q2 = select(bb & 0x0fu, bb >> 4u, ((kk + 2u) & 1u) != 0u);
+            let q3 = select(bb & 0x0fu, bb >> 4u, ((kk + 3u) & 1u) != 0u);
+            let sa0 = scales[col * blocks + kk / 32u];
+            let sa1 = scales[col * blocks + (kk + 1u) / 32u];
+            let sa2 = scales[col * blocks + (kk + 2u) / 32u];
+            let sa3 = scales[col * blocks + (kk + 3u) / 32u];
+            let av = vec4<f32>(
+                a[row * pc.k + kk],
+                a[row * pc.k + kk + 1u],
+                a[row * pc.k + kk + 2u],
+                a[row * pc.k + kk + 3u],
+            );
+            let wv = vec4<f32>(
+                (f32(q0) - 8.0) * sa0,
+                (f32(q1) - 8.0) * sa1,
+                (f32(q2) - 8.0) * sa2,
+                (f32(q3) - 8.0) * sa3,
+            );
+            sum = sum + dot(av, wv);
+        }
+    }
+    partial[tid] = sum;
+    workgroupBarrier();
+    for (var s = KL / 2u; s > 0u; s = s / 2u) {
+        if (k_lane < s) {
+            partial[tid] = partial[tid] + partial[tid + s * COLS];
+        }
+        workgroupBarrier();
+    }
+    if (k_lane == 0u && valid) {
+        y[row * pc.n + col] = partial[tid];
+    }
+}
+"#;
+
+/// K-major variant of `MATMUL_NBITS_Q4_SPLITK_DEEP` (pass 1). Same math as the
+/// colmajor deep kernel; weight bytes come from the `[k/2][n]` layout via
+/// `kbyte`. Scales stay in ONNX `[n][k/32]` order.
+pub const MATMUL_NBITS_Q4_SPLITK_DEEP_KMAJOR: &str = r#"
+struct Params { m: u32, k: u32, n: u32, k_chunks: u32 }
+var<immediate> pc: Params;
+
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> packed_w: array<u32>;
+@group(0) @binding(2) var<storage, read> scales: array<f32>;
+@group(0) @binding(3) var<storage, read_write> partial: array<f32>;
+
+const COLS: u32 = 32u;
+const KL: u32 = 8u;
+
+var<workgroup> lds: array<f32, 256>;
+
+fn kbyte(idx: u32) -> u32 {
+    let w = packed_w[idx >> 2u];
+    return (w >> ((idx & 3u) * 8u)) & 0xffu;
+}
+
+@compute @workgroup_size(256)
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_index) tid: u32,
+) {
+    let col_lane = tid % COLS;
+    let k_lane = tid / COLS;
+    let row = wid.x;
+    let chunk = wid.y;
+    let col = wid.z * COLS + col_lane;
+    let valid = col < pc.n;
+    let blocks = pc.k / 32u;
+    let slice = pc.k / pc.k_chunks;
+    let lane_span = slice / KL;
+    let k_start = chunk * slice + k_lane * lane_span;
+    let n = pc.n;
+    var sum = 0.0;
+    if (valid) {
+        var kk = k_start;
+        let k_end = k_start + lane_span;
+        for (; kk + 4u <= k_end; kk = kk + 4u) {
+            let ba = kbyte((kk / 2u) * n + col);
+            let bb = kbyte(((kk + 2u) / 2u) * n + col);
+            let q0 = select(ba & 0x0fu, ba >> 4u, (kk & 1u) != 0u);
+            let q1 = select(ba & 0x0fu, ba >> 4u, ((kk + 1u) & 1u) != 0u);
+            let q2 = select(bb & 0x0fu, bb >> 4u, ((kk + 2u) & 1u) != 0u);
+            let q3 = select(bb & 0x0fu, bb >> 4u, ((kk + 3u) & 1u) != 0u);
+            let sa0 = scales[col * blocks + kk / 32u];
+            let sa1 = scales[col * blocks + (kk + 1u) / 32u];
+            let sa2 = scales[col * blocks + (kk + 2u) / 32u];
+            let sa3 = scales[col * blocks + (kk + 3u) / 32u];
+            let av = vec4<f32>(
+                a[row * pc.k + kk],
+                a[row * pc.k + kk + 1u],
+                a[row * pc.k + kk + 2u],
+                a[row * pc.k + kk + 3u],
+            );
+            let wv = vec4<f32>(
+                (f32(q0) - 8.0) * sa0,
+                (f32(q1) - 8.0) * sa1,
+                (f32(q2) - 8.0) * sa2,
+                (f32(q3) - 8.0) * sa3,
+            );
+            sum = sum + dot(av, wv);
+        }
+    }
+    lds[tid] = sum;
+    workgroupBarrier();
+    for (var s = KL / 2u; s > 0u; s = s / 2u) {
+        if (k_lane < s) {
+            lds[tid] = lds[tid] + lds[tid + s * COLS];
+        }
+        workgroupBarrier();
+    }
+    if (k_lane == 0u && valid) {
+        partial[(row * pc.k_chunks + chunk) * pc.n + col] = lds[tid];
+    }
+}
+"#;
+
 /// Small-M tiled Q4 GEMM for prefill (m=2..~144).
 ///
 /// The split-K kernel is one-thread-per-output-column with an 8-way intra-K
@@ -489,5 +659,9 @@ mod tests {
             .expect("MatMulNBits Q4 split-K-deep reduce (pass 2) must compile to SPIR-V");
         vk_compute::compile_wgsl(super::MATMUL_NBITS_Q4_TILED_SMALL_M)
             .expect("MatMulNBits Q4 small-M tiled shader must compile to SPIR-V");
+        vk_compute::compile_wgsl(super::MATMUL_NBITS_Q4_SPLITK_KMAJOR)
+            .expect("MatMulNBits Q4 split-K kmajor shader must compile to SPIR-V");
+        vk_compute::compile_wgsl(super::MATMUL_NBITS_Q4_SPLITK_DEEP_KMAJOR)
+            .expect("MatMulNBits Q4 split-K deep kmajor shader must compile to SPIR-V");
     }
 }
