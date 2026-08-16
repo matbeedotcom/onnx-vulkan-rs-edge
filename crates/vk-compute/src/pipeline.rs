@@ -1,9 +1,25 @@
 //! Pipeline compute + dispatch sincrono.
+//!
+//! Pipeline-creation diagnostics (`ONNX_VULKAN_PIPELINE_TRACE=1`, default):
+//! every `vkCreateComputePipelines` is wall-timed and, when the device
+//! supports `VK_EXT_pipeline_creation_feedback`, reports the driver's own
+//! creation duration and whether the APPLICATION pipeline cache supplied a
+//! usable pipeline. This is the measurement that settles whether a slow first
+//! inference is ACO compilation hiding in pipeline creation or something in
+//! the submission/queue path. `ONNX_VULKAN_CACHE_VERIFY=1` additionally
+//! creates with `VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED` so a
+//! genuine cache hit succeeds while any required compilation is reported as a
+//! miss without doing the work — a unit test for the persistent cache.
 
 use crate::buffer::GpuBuffer;
 use crate::context::VkContext;
 use anyhow::Result;
 use ash::vk;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
+
+/// Counter of pipeline creations in this process, for the `[pipeline]` lines.
+static PIPELINE_CREATIONS: AtomicUsize = AtomicUsize::new(0);
 
 /// Range of buffer bound to binding: descriptor starts at `offset`,
 /// so shader indexes starting from tensor origin. Needed for ORT's memory
@@ -120,10 +136,93 @@ impl VkContext {
                 .as_ref()
                 .copied()
                 .unwrap_or(vk::PipelineCache::null());
-            let pipeline = device
-                .create_compute_pipelines(cache_handle, &[info], None)
-                .map_err(|(_, e)| e)?[0];
+
+            // Diagnostics: wall-time the creation (the call where ACO compile
+            // would show up) and read the driver's own feedback. The feedback
+            // struct's address is stored in `info.p_next` and dereferenced by
+            // the driver during the call below, so it must outlive it.
+            let pipeline_trace = std::env::var_os("ONNX_VULKAN_PIPELINE_TRACE")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            let cache_verify = std::env::var_os("ONNX_VULKAN_CACHE_VERIFY").is_some();
+            let mut feedback = vk::PipelineCreationFeedback::default();
+            let mut feedback_info: Option<
+                vk::PipelineCreationFeedbackCreateInfo<'_>,
+            > = None;
+            if pipeline_trace && self.pipeline_creation_feedback {
+                let mut fi = vk::PipelineCreationFeedbackCreateInfo::default();
+                fi.p_pipeline_creation_feedback = &mut feedback;
+                feedback_info = Some(fi);
+                info.push_next(
+                    feedback_info
+                        .as_mut()
+                        .expect("set just above"),
+                );
+            }
+            // ONNX_VULKAN_CACHE_VERIFY (with VK_EXT_pipeline_creation_cache_
+            // control): create with FAIL_ON_PIPELINE_COMPILE_REQUIRED so a
+            // genuine application-cache hit succeeds while any required
+            // compilation fails FAST without doing the work — a unit test for
+            // the persistent cache. A reported miss is then created normally.
+            let verify_flags = if cache_verify && self.pipeline_creation_cache_control {
+                vk::PipelineCreateFlags::FAIL_ON_PIPELINE_COMPILE_REQUIRED
+            } else {
+                vk::PipelineCreateFlags::empty()
+            };
+            let pipeline_creation_feedback_attached = feedback_info.is_some();
+            let t_create = Instant::now();
+            let mut make = |flags: vk::PipelineCreateFlags| -> Result<vk::Pipeline> {
+                let mut info = info;
+                info.flags = flags;
+                device
+                    .create_compute_pipelines(cache_handle, &[info], None)
+                    .map(|p| p[0])
+                    .map_err(|(_, e)| anyhow::anyhow!("vkCreateComputePipelines: {e:#}"))
+            };
+            let pipeline = match make(verify_flags) {
+                Ok(p) => p,
+                Err(e) if cache_verify && e.to_string().contains("PIPELINE_COMPILE_REQUIRED") => {
+                    let label = crate::stats::current_op();
+                    eprintln!(
+                        "[pipeline] #{:<4} {} MISS compile-required (wall {}ms)",
+                        PIPELINE_CREATIONS.fetch_add(1, Ordering::Relaxed) + 1,
+                        label,
+                        t_create.elapsed().as_millis(),
+                    );
+                    make(vk::PipelineCreateFlags::empty())?
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "vkCreateComputePipelines failed for op '{}': {e:#}",
+                        crate::stats::current_op()
+                    ))
+                }
+            };
             drop(size_info_opt); // keep alive until after creation
+            if pipeline_trace {
+                let label = crate::stats::current_op();
+                let idx = PIPELINE_CREATIONS.fetch_add(1, Ordering::Relaxed) + 1;
+                let wall_ms = t_create.elapsed().as_millis();
+                if pipeline_creation_feedback_attached {
+                    let cache_hit = feedback.flags.contains(
+                        vk::PipelineCreationFeedbackFlags::APPLICATION_PIPELINE_CACHE_HIT,
+                    );
+                    eprintln!(
+                        "[pipeline] #{:<4} {} create_wall={}ms driver={}ms cache_hit={}",
+                        idx,
+                        label,
+                        wall_ms,
+                        feedback.duration as f64 / 1e6,
+                        cache_hit,
+                    );
+                } else {
+                    eprintln!(
+                        "[pipeline] #{:<4} {} create_wall={}ms (feedback n/a)",
+                        idx, label, wall_ms,
+                    );
+                }
+            }
+            drop(feedback_info);
 
             Ok(ComputePipeline {
                 pipeline,

@@ -22,9 +22,10 @@ thread_local! {
 }
 
 pub fn set_op(name: &'static str) {
-    if enabled() {
-        CURRENT_OP.with(|c| c.set(name));
-    }
+    // Always write: the thread-local also feeds per-pipeline-creation
+    // attribution (the op label at `vkCreateComputePipelines` time), which must
+    // work with `VULKAN_EP_STATS` off. Cheap thread-local store.
+    CURRENT_OP.with(|c| c.set(name));
 }
 
 pub fn current_op() -> &'static str {

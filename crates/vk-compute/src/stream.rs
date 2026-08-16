@@ -522,13 +522,17 @@ impl VkContext {
         if let Some(pool) = query_pool {
             let slots = ts_ops.len();
             if slots > 0 {
-                let mut data = vec![0u32; slots + 1];
+                // 64-bit query results: the spec returns 32-bit timestamps
+                // without VK_QUERY_RESULT_64_BIT, and overflowing 32-bit
+                // values wrap/saturate — intervals crossing the wrap read as
+                // negative and were silently dropped by `ns.max(0.0)`.
+                let mut data = vec![0u64; slots + 1];
                 let status = unsafe {
                     self.device.get_query_pool_results(
                         pool,
                         0,
                         &mut data,
-                        vk::QueryResultFlags::empty(),
+                        vk::QueryResultFlags::TYPE_64,
                     )
                 };
                 // The fence was waited above, so every timestamp in this

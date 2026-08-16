@@ -73,6 +73,13 @@ pub struct VkContext {
     pub(crate) pipeline_cache: Mutex<Option<vk::PipelineCache>>,
     /// Where the pipeline cache is persisted (None = do not persist).
     pub(crate) pipeline_cache_path: Mutex<Option<std::path::PathBuf>>,
+    /// `VK_EXT_pipeline_creation_feedback` enabled: per-pipeline creation
+    /// duration + application-cache-hit flag can be read after creation.
+    pub(crate) pipeline_creation_feedback: bool,
+    /// `VK_EXT_pipeline_creation_cache_control` enabled:
+    /// `VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED` may be passed
+    /// (used by `ONNX_VULKAN_CACHE_VERIFY` to unit-test the persistent cache).
+    pub(crate) pipeline_creation_cache_control: bool,
 }
 
 /// Timestamp slot in profiling query pool.
@@ -197,6 +204,30 @@ impl VkContext {
             enabled_exts.push(vk::EXT_SUBGROUP_SIZE_CONTROL_NAME.as_ptr());
         }
 
+        // Pipeline-creation diagnostics. VK_EXT_pipeline_creation_feedback
+        // needs no feature. VK_EXT_pipeline_creation_cache_control needs the
+        // *extension* feature `pipeline_creation_cache_control` (query via the
+        // ext feature struct, since the app runs at apiVersion 1.2 and cannot
+        // enable the 1.3 core promotion of it).
+        let pipeline_creation_feedback =
+            has_ext(vk::EXT_PIPELINE_CREATION_FEEDBACK_NAME);
+        if pipeline_creation_feedback {
+            enabled_exts.push(vk::EXT_PIPELINE_CREATION_FEEDBACK_NAME.as_ptr());
+        }
+        let mut cache_control_features =
+            vk::PhysicalDevicePipelineCreationCacheControlFeatures::default();
+        let mut cc_features2 = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut cache_control_features);
+        unsafe {
+            instance.get_physical_device_features2(physical_device, &mut cc_features2)
+        };
+        let pipeline_creation_cache_control =
+            has_ext(vk::EXT_PIPELINE_CREATION_CACHE_CONTROL_NAME)
+                && cache_control_features.pipeline_creation_cache_control == vk::TRUE;
+        if pipeline_creation_cache_control {
+            enabled_exts.push(vk::EXT_PIPELINE_CREATION_CACHE_CONTROL_NAME.as_ptr());
+        }
+
         // Default wave width for the matmul kernels, chosen once at startup from
         // device capabilities (see `matmul_wave_size`). ON the VANGOGH (Deck) the
         // device default is 64, but the matmul shaders are laid out for 32-wide
@@ -240,6 +271,12 @@ impl VkContext {
             device_info = device_info
                 .push_next(&mut coop_features)
                 .push_next(&mut vk12_features);
+        }
+        // Pipeline-creation diagnostic extension feature: chain onto device
+        // creation (the ext names themselves were pushed above, before
+        // `device_info` borrowed `enabled_exts`).
+        if pipeline_creation_cache_control {
+            device_info = device_info.push_next(&mut cache_control_features);
         }
         let device = unsafe { instance.create_device(physical_device, &device_info, None) }
             .context("creazione VkDevice")?;
@@ -329,6 +366,8 @@ impl VkContext {
             storage_pool: Mutex::new(Default::default()),
             pipeline_cache: Mutex::new(pipeline_cache),
             pipeline_cache_path: Mutex::new(cache_path),
+            pipeline_creation_feedback,
+            pipeline_creation_cache_control,
         })
     }
 
