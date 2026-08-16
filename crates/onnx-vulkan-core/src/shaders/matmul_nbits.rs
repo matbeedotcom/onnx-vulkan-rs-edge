@@ -353,6 +353,126 @@ pub const SPLITK_DEEP_BINDINGS: u32 = 4;
 /// Bindings for the reduce (pass-2) kernel: partial, y.
 pub const SPLITK_REDUCE_BINDINGS: u32 = 2;
 
+/// Small-M tiled Q4 GEMM for prefill (m=2..~144).
+///
+/// The split-K kernel is one-thread-per-output-column with an 8-way intra-K
+/// reduction; for m>1 every row independently re-reads and re-unpacks the same
+/// Q4 weights, which dominates (m=31, n=8192, k=2048 measured at 3390 ms/op).
+/// This kernel stages a `BM=4` row × `BK=32` K-block tile of dequantized
+/// weights in shared memory ONCE per k-block and does `BM` dot-products
+/// (one per row) against it — the Q4 unpack (shift/mask/dequant-scale) is
+/// amortized across 4 rows, and weights are read only once per
+/// (rowtile, coltile) instead of once per row. Accumulation is in registers
+/// across all K-blocks; the output is written exactly once at the end (no
+/// global read-modify-write).
+///
+/// Layout: 256-thread workgroup (32 col-lanes × 8 staging threads). Grid:
+/// (ceil(m/BM), 1, ceil(n/BN)) — each workgroup covers one BM×BN tile and loops
+/// over all K-blocks. LDS: B tile [BK][BN]=1024 f32 + A tile [BM][BK]=128 f32.
+///
+/// Requires `k % 32 == 0` (K advances in whole scale-blocks) and m*4 to be the
+/// padded row extent (rows >= m are masked). Push is `{m,k,n}`.
+pub const MATMUL_NBITS_Q4_TILED_SMALL_M: &str = r#"
+struct Params { m: u32, k: u32, n: u32 }
+var<immediate> pc: Params;
+
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> packed_w: array<u32>;
+@group(0) @binding(2) var<storage, read> scales: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+
+const BM: u32 = 4u;
+const BK: u32 = 32u;
+const BN: u32 = 32u;
+
+var<workgroup> b_lds: array<f32, 1024>;
+var<workgroup> a_lds: array<f32, 128>;
+
+@compute @workgroup_size(256)
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_index) tid: u32,
+) {
+    let col_lane = tid % BN;
+    let stage = tid / BN;        // 0..7
+    let row0 = wid.x * BM;       // first output row of this tile
+    let col0 = wid.z * BN;       // first output col of this tile
+    let nblocks = pc.k / BK;
+
+    var acc0 = 0.0;
+    var acc1 = 0.0;
+    var acc2 = 0.0;
+    var acc3 = 0.0;
+
+    for (var kb = 0u; kb < nblocks; kb = kb + 1u) {
+        // --- Stage A: BM=4 rows x BK=32 cols = 128 f32; 16 per thread.
+        // Thread `stage` handles k-cols [stage*4, stage*4+4) for all 4 rows.
+        for (var r = 0u; r < BM; r = r + 1u) {
+            let grow = row0 + r;
+            var v0 = 0.0; var v1 = 0.0; var v2 = 0.0; var v3 = 0.0;
+            if (grow < pc.m) {
+                let base = grow * pc.k + kb * BK;
+                v0 = a[base + stage * 4u + 0u];
+                v1 = a[base + stage * 4u + 1u];
+                v2 = a[base + stage * 4u + 2u];
+                v3 = a[base + stage * 4u + 3u];
+            }
+            a_lds[r * BK + stage * 4u + 0u] = v0;
+            a_lds[r * BK + stage * 4u + 1u] = v1;
+            a_lds[r * BK + stage * 4u + 2u] = v2;
+            a_lds[r * BK + stage * 4u + 3u] = v3;
+        }
+        // --- Stage B (dequant): BK=32 K-rows x BN=32 cols = 1024 f32;
+        // 128 per thread... no, 4 rows x 32 cols = 128 per thread? 256 threads
+        // x 4 = 1024. Thread `stage` handles K-rows [stage*4, stage*4+4) for
+        // all 32 cols. Each B element = one Q4 nibble from packed_w + one scale.
+        for (var rr = 0u; rr < 4u; rr = rr + 1u) {
+            let brow = kb * BK + stage * 4u + rr;  // global K index
+            for (var c = 0u; c < BN; c = c + 1u) {
+                let col = col0 + c;
+                if (col >= pc.n) {
+                    b_lds[(stage * 4u + rr) * BN + c] = 0.0;
+                    continue;
+                }
+                let byte_index = col * (pc.k / 2u) + (brow / 2u);
+                let word = packed_w[byte_index >> 2u];
+                let byte = (word >> ((byte_index & 3u) * 8u)) & 0xffu;
+                let q = select(byte & 0x0fu, byte >> 4u, (brow & 1u) != 0u);
+                let scale = scales[col * (pc.k / 32u) + kb];
+                b_lds[(stage * 4u + rr) * BN + c] = (f32(q) - 8.0) * scale;
+            }
+        }
+        workgroupBarrier();
+        // --- Inner product: BM=4 dot-products, one per row, 32 elements each.
+        // a_lds[row][kk] broadcast across threads; b_lds[kk][col_lane] is
+        // each thread's own column. 4 rows x 32 k = 128 FMA per thread.
+        for (var kk = 0u; kk < BK; kk = kk + 1u) {
+            let bcol = b_lds[kk * BN + col_lane];
+            acc0 = fma(a_lds[0u * BK + kk], bcol, acc0);
+            acc1 = fma(a_lds[1u * BK + kk], bcol, acc1);
+            acc2 = fma(a_lds[2u * BK + kk], bcol, acc2);
+            acc3 = fma(a_lds[3u * BK + kk], bcol, acc3);
+        }
+        workgroupBarrier();
+    }
+
+    // --- Write the 4-row x 1-col micro-tile once (no global RMW).
+    let gcol = col0 + col_lane;
+    if (gcol >= pc.n) { return; }
+    if (row0 + 0u < pc.m) { y[(row0 + 0u) * pc.n + gcol] = acc0; }
+    if (row0 + 1u < pc.m) { y[(row0 + 1u) * pc.n + gcol] = acc1; }
+    if (row0 + 2u < pc.m) { y[(row0 + 2u) * pc.n + gcol] = acc2; }
+    if (row0 + 3u < pc.m) { y[(row0 + 3u) * pc.n + gcol] = acc3; }
+}
+"#;
+
+/// Bindings for the small-M tiled kernel: a, packed_w, scales, y.
+pub const TILED_SMALL_M_BINDINGS: u32 = 4;
+/// Push-constant size for the small-M tiled kernel: {m,k,n} (12 bytes).
+pub const TILED_SMALL_M_PUSH_BYTES: u32 = 12;
+/// BM (rows per tile) for the small-M tiled kernel.
+pub const TILED_SMALL_M_BM: u32 = 4;
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -367,5 +487,7 @@ mod tests {
             .expect("MatMulNBits Q4 split-K-deep (pass 1) must compile to SPIR-V");
         vk_compute::compile_wgsl(super::MATMUL_NBITS_Q4_SPLITK_REDUCE)
             .expect("MatMulNBits Q4 split-K-deep reduce (pass 2) must compile to SPIR-V");
+        vk_compute::compile_wgsl(super::MATMUL_NBITS_Q4_TILED_SMALL_M)
+            .expect("MatMulNBits Q4 small-M tiled shader must compile to SPIR-V");
     }
 }

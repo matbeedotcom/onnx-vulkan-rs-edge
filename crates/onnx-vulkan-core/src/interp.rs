@@ -67,8 +67,10 @@ use crate::shaders::matmul_integer::{
 use crate::shaders::matmul_nbits::{
     BINDINGS as MMNB_BINDINGS, MATMUL_NBITS_Q4, MATMUL_NBITS_Q4_SPLITK,
     MATMUL_NBITS_Q4_SPLITK_DEEP, MATMUL_NBITS_Q4_SPLITK_REDUCE, MATMUL_NBITS_Q4_TILED,
-    PUSH_BYTES as MMNB_PUSH_BYTES, SPLITK_DEEP_BINDINGS as MMNB_DEEP_BINDINGS,
-    SPLITK_DEEP_PUSH_BYTES as MMNB_DEEP_PUSH_BYTES, SPLITK_REDUCE_BINDINGS as MMNB_RED_BINDINGS,
+    MATMUL_NBITS_Q4_TILED_SMALL_M, PUSH_BYTES as MMNB_PUSH_BYTES,
+    SPLITK_DEEP_BINDINGS as MMNB_DEEP_BINDINGS, SPLITK_DEEP_PUSH_BYTES as MMNB_DEEP_PUSH_BYTES,
+    SPLITK_REDUCE_BINDINGS as MMNB_RED_BINDINGS, TILED_SMALL_M_BM as MMNB_SM_BM,
+    TILED_SMALL_M_BINDINGS as MMNB_SM_BINDINGS, TILED_SMALL_M_PUSH_BYTES as MMNB_SM_PUSH_BYTES,
     WORKGROUP_SIZE as MMNB_WORKGROUP_SIZE,
 };
 use crate::shaders::movement::{
@@ -679,6 +681,18 @@ fn matmul_nbits_q4(env: &mut Env, node: &NodeIr) -> Result<()> {
             && m == 1
             && (n as u32) >= 256
             && ((k / 32) as u32) % k_chunks == 0;
+        // Small-M tiled GEMM for prefill (m>1): stage a BM=4 x BK=32 dequantized
+        // weight tile in LDS and do 4 dot-products against it, amortizing the Q4
+        // unpack across 4 rows. Deck A/B (2026-08-15) shows it is a REGRESSION
+        // vs the per-row split-K (prefill 8.8 s -> 10.7 s; m=31 n=8192 k=2048
+        // 3391 -> 4622 us/op): the extra LDS staging + 1.25 KB LDS per workgroup
+        // and the 4-row padding overhead outweigh the unpack amortization on
+        // these shapes. OFF by default; kept behind an env flag for A/B.
+        let use_small_m = m > 1
+            && use_splitk
+            && std::env::var("LFM25_NBITS_SMALL_M")
+                .map(|v| v == "1")
+                .unwrap_or(false);
         // Env-gated shape dump for kernel design: prints the (m,n,k) of every
         // MatMulNBits dispatch so the prefill (m>1) geometry can be profiled.
         if std::env::var("LFM25_NBITS_SHAPES").is_ok() {
@@ -704,7 +718,11 @@ fn matmul_nbits_q4(env: &mut Env, node: &NodeIr) -> Result<()> {
             .unwrap_or_default();
         let (kernel_key, kernel_src): (&'static str, &'static str) = if force_scalar {
             ("MatMulNBitsQ4_B32", MATMUL_NBITS_Q4)
+        } else if use_small_m {
+            ("MatMulNBitsQ4_TiledSM", MATMUL_NBITS_Q4_TILED_SMALL_M)
         } else if use_splitk {
+            // m==1 (non-deep) and m>1 split-K. (m==1 with use_deep is dispatched
+            // separately below and never reaches this selection.)
             ("MatMulNBitsQ4_SplitK", MATMUL_NBITS_Q4_SPLITK)
         } else {
             ("MatMulNBitsQ4_Tiled", MATMUL_NBITS_Q4_TILED)
@@ -788,6 +806,14 @@ fn matmul_nbits_q4(env: &mut Env, node: &NodeIr) -> Result<()> {
             let pipeline = unsafe { &*pipeline };
             let grid: [u32; 3] = if force_scalar {
                 [(elem_count as u32).div_ceil(MMNB_WORKGROUP_SIZE), 1, 1]
+            } else if use_small_m {
+                // Small-M tiled: grid.x = row tile (BM=4 rows), grid.z = 32-col
+                // tile. Each workgroup loops over all K-blocks internally.
+                [
+                    (m as u32).div_ceil(MMNB_SM_BM),
+                    1,
+                    (n as u32).div_ceil(32),
+                ]
             } else if use_splitk {
                 // grid.x = output row, grid.z = 32-column tile. Each
                 // workgroup is (32 cols x 8 k-lanes) = 256 threads.
