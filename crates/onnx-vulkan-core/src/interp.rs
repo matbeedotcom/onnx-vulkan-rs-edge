@@ -65,8 +65,11 @@ use crate::shaders::matmul_integer::{
     coop_variant as mmi_coop_variant, matmul as mmi_matmul,
 };
 use crate::shaders::matmul_nbits::{
-    BINDINGS as MMNB_BINDINGS, MATMUL_NBITS_Q4, MATMUL_NBITS_Q4_SPLITK, MATMUL_NBITS_Q4_TILED,
-    PUSH_BYTES as MMNB_PUSH_BYTES, WORKGROUP_SIZE as MMNB_WORKGROUP_SIZE,
+    BINDINGS as MMNB_BINDINGS, MATMUL_NBITS_Q4, MATMUL_NBITS_Q4_SPLITK,
+    MATMUL_NBITS_Q4_SPLITK_DEEP, MATMUL_NBITS_Q4_SPLITK_REDUCE, MATMUL_NBITS_Q4_TILED,
+    PUSH_BYTES as MMNB_PUSH_BYTES, SPLITK_DEEP_BINDINGS as MMNB_DEEP_BINDINGS,
+    SPLITK_DEEP_PUSH_BYTES as MMNB_DEEP_PUSH_BYTES, SPLITK_REDUCE_BINDINGS as MMNB_RED_BINDINGS,
+    WORKGROUP_SIZE as MMNB_WORKGROUP_SIZE,
 };
 use crate::shaders::movement::{
     CONCAT, CONCAT_BINDINGS, CONCAT_PUSH_BYTES, GATHER, GATHER_BINDINGS, GATHER_PUSH_BYTES, PAD,
@@ -647,10 +650,41 @@ fn matmul_nbits_q4(env: &mut Env, node: &NodeIr) -> Result<()> {
         let use_splitk = !force_scalar
             && (splitk_max_m == 0 || m as u32 <= splitk_max_m)
             && k.is_multiple_of(32);
+        // Inter-workgroup split-K (two-pass) for the m==1 decode GEMVs.
+        // Single-pass launches n/32 workgroups; for small n that under-fills
+        // the CUs and each workgroup's (8-way intra) K chain is long, so the
+        // op is latency-bound (n=2048, k=8192 = 331 ms/op). Splitting K across
+        // k_chunks workgroups multiplies occupancy by k_chunks and shortens
+        // the chain by the same factor; a second pass sums the partials in
+        // fixed chunk order (deterministic).
+        //
+        // Fixed k_chunks = 8 is the Deck-tuned default: it beats both C=4
+        // (22.8 s vs 21.4 s wall) and a per-shape "target 32 steps/lane"
+        // heuristic (23.7 s — too conservative for the k=2048 shapes, where
+        // C=8 still wins). Requires m==1 (prefill already has m*n/32
+        // workgroups), n>=256 (tiny shapes gain nothing), and (k/32)%8==0
+        // (exact chunks — never a partial). Env A/B override:
+        // LFM25_NBITS_K_CHUNKS (>=1 forces that count for m==1; 1 = off).
+        let k_chunks: u32 = if m == 1 {
+            std::env::var("LFM25_NBITS_K_CHUNKS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&c| c >= 1)
+                .unwrap_or(8)
+        } else {
+            1
+        };
+        let use_deep = use_splitk
+            && k_chunks > 1
+            && m == 1
+            && (n as u32) >= 256
+            && ((k / 32) as u32) % k_chunks == 0;
         // Env-gated shape dump for kernel design: prints the (m,n,k) of every
         // MatMulNBits dispatch so the prefill (m>1) geometry can be profiled.
         if std::env::var("LFM25_NBITS_SHAPES").is_ok() {
-            eprintln!("[nbits] m={m} n={n} k={k} splitk={use_splitk}");
+            eprintln!(
+                "[nbits] m={m} n={n} k={k} splitk={use_splitk} deep={use_deep} k_chunks={k_chunks}"
+            );
         }
         // Wave width for the matmul pipeline, chosen at startup from device
         // capabilities (ctx.matmul_wave_size): 32 on Van Gogh (device default
@@ -691,34 +725,84 @@ fn matmul_nbits_q4(env: &mut Env, node: &NodeIr) -> Result<()> {
             kernel_key
         };
         vk_compute::stats::set_op(stats_label);
-        let pipeline = env.cache().pipeline(full_key, || {
-            ctx.create_pipeline_forced(
-                &compile_wgsl(kernel_src)?,
-                MMNB_BINDINGS,
-                MMNB_PUSH_BYTES,
-                forced_subgroup,
-            )
-        })?;
-        // SAFETY: same contract as `with_pipeline` — the cache never removes
-        // entries and boxes them on the heap, so the address stays valid for
-        // the cache's lifetime, which outlives this execution.
-        let pipeline = unsafe { &*pipeline };
-        let grid: [u32; 3] = if force_scalar {
-            [(elem_count as u32).div_ceil(MMNB_WORKGROUP_SIZE), 1, 1]
-        } else if use_splitk {
-            // grid.x = output row, grid.z = 32-column tile. Each
-            // workgroup is (32 cols x 8 k-lanes) = 256 threads.
-            [m as u32, 1, (n as u32).div_ceil(32)]
+        if use_deep {
+            // Two-pass inter-workgroup split-K. Pass 1: each (row, chunk,
+            // coltile) workgroup reduces its K-slice (32 cols x 8 k-lanes, the
+            // proven tree-reduce) and writes a per-column partial to scratch.
+            // Pass 2: each output sums its k_chunks partials in fixed chunk
+            // order. Both pipelines carry the wave forcing like the rest of the
+            // matmul path (256-thread workgroups, so a forced 32 divides them).
+            let partial_elems = (m * n * k_chunks as usize)
+                .try_into()
+                .context("MatMulNBits: partial overflow")?;
+            let partial = ctx.create_storage_buffer(device_storage_bytes(FLOAT, partial_elems)?)?;
+            let deep_key = format!("MatMulNBitsQ4_SplitK_Deep{wave_key}");
+            let reduce_key = format!("MatMulNBitsQ4_SplitK_Reduce{wave_key}");
+            let mut deep_push = Vec::with_capacity(MMNB_DEEP_PUSH_BYTES as usize);
+            for value in [m as u32, k as u32, n as u32, k_chunks] {
+                deep_push.extend_from_slice(&value.to_le_bytes());
+            }
+            let pipeline = env.cache().pipeline(deep_key, || {
+                ctx.create_pipeline_forced(
+                    &compile_wgsl(MATMUL_NBITS_Q4_SPLITK_DEEP)?,
+                    MMNB_DEEP_BINDINGS,
+                    MMNB_DEEP_PUSH_BYTES,
+                    forced_subgroup,
+                )
+            })?;
+            let pipeline = unsafe { &*pipeline };
+            ctx.stream_dispatch(
+                pipeline,
+                &[a.buffer(), w.buffer(), scales.buffer(), &partial],
+                &deep_push,
+                [m as u32, k_chunks, (n as u32).div_ceil(32)],
+            )?;
+            let red_pipeline = env.cache().pipeline(reduce_key, || {
+                ctx.create_pipeline_forced(
+                    &compile_wgsl(MATMUL_NBITS_Q4_SPLITK_REDUCE)?,
+                    MMNB_RED_BINDINGS,
+                    MMNB_DEEP_PUSH_BYTES,
+                    forced_subgroup,
+                )
+            })?;
+            let red_pipeline = unsafe { &*red_pipeline };
+            ctx.stream_dispatch(
+                red_pipeline,
+                &[&partial, &out],
+                &deep_push,
+                [(elem_count as u32).div_ceil(MMNB_WORKGROUP_SIZE), 1, 1],
+            )?;
+            ctx.defer_destroy(partial);
         } else {
-            // vec4-per-thread: one thread per output, workgroup 256.
-            [elem_count as u32, 1, 1]
-        };
-        ctx.stream_dispatch(
-            pipeline,
-            &[a.buffer(), w.buffer(), scales.buffer(), &out],
-            &push,
-            grid,
-        )?;
+            let pipeline = env.cache().pipeline(full_key, || {
+                ctx.create_pipeline_forced(
+                    &compile_wgsl(kernel_src)?,
+                    MMNB_BINDINGS,
+                    MMNB_PUSH_BYTES,
+                    forced_subgroup,
+                )
+            })?;
+            // SAFETY: same contract as `with_pipeline` — the cache never removes
+            // entries and boxes them on the heap, so the address stays valid for
+            // the cache's lifetime, which outlives this execution.
+            let pipeline = unsafe { &*pipeline };
+            let grid: [u32; 3] = if force_scalar {
+                [(elem_count as u32).div_ceil(MMNB_WORKGROUP_SIZE), 1, 1]
+            } else if use_splitk {
+                // grid.x = output row, grid.z = 32-column tile. Each
+                // workgroup is (32 cols x 8 k-lanes) = 256 threads.
+                [m as u32, 1, (n as u32).div_ceil(32)]
+            } else {
+                // vec4-per-thread: one thread per output, workgroup 256.
+                [elem_count as u32, 1, 1]
+            };
+            ctx.stream_dispatch(
+                pipeline,
+                &[a.buffer(), w.buffer(), scales.buffer(), &out],
+                &push,
+                grid,
+            )?;
+        }
     }
     let mut out_shape = a_shape;
     *out_shape.last_mut().expect("activation rank checked") = n as i64;

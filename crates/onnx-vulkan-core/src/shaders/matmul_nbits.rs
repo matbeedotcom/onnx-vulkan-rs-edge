@@ -225,6 +225,134 @@ fn main(
 }
 "#;
 
+/// Q4 matmul with inter-workgroup split-K for the skinny-n / large-k decode
+/// GEMV (e.g. m=1 n=2048 k=8192).
+///
+/// The intra-workgroup split-K kernel above launches `ceil(n/32)` workgroups;
+/// for small `n` that is far too few to fill Vangogh's 20 CUs, so each one
+/// carries a long dependent K chain and the op is latency-bound (n=2048,
+/// k=8192 measured at 331 ms/op — ~12000x off the memory peak). This kernel
+/// adds a `k_chunks` grid dimension: workgroup `(row, chunk, coltile)` reduces
+/// only its K-slice (the same 32-col × 8-k-lane intra-workgroup tree-reduce as
+/// before, but over `k / k_chunks / 8` vec4 steps instead of `k / 8`), then
+/// writes the per-column partial to a scratch buffer. A second pass
+/// (`MATMUL_NBITS_Q4_SPLITK_REDUCE`) sums the `k_chunks` partials in fixed
+/// order. Both passes are deterministic: the intra-workgroup reduce reuses the
+/// validated tree-reduce, and the cross-chunk sum is a fixed-order sequential
+/// add (chunk 0, 1, 2, ...), so the result is reproducible run-to-run.
+///
+/// `k_chunks` must divide `k / 32` (so every chunk's 8 k-lanes each get a whole
+/// number of vec4 steps); the host guarantees that. Push is `{m,k,n,k_chunks}`.
+pub const MATMUL_NBITS_Q4_SPLITK_DEEP: &str = r#"
+struct Params { m: u32, k: u32, n: u32, k_chunks: u32 }
+var<immediate> pc: Params;
+
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> packed_w: array<u32>;
+@group(0) @binding(2) var<storage, read> scales: array<f32>;
+@group(0) @binding(3) var<storage, read_write> partial: array<f32>;
+
+const COLS: u32 = 32u;
+const KL: u32 = 8u;
+
+var<workgroup> lds: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_index) tid: u32,
+) {
+    let col_lane = tid % COLS;
+    let k_lane = tid / COLS;
+    let row = wid.x;
+    let chunk = wid.y;
+    let col = wid.z * COLS + col_lane;
+    let valid = col < pc.n;
+    let blocks = pc.k / 32u;
+    let slice = pc.k / pc.k_chunks;      // K extent of this chunk
+    let lane_span = slice / KL;          // K extent of this k-lane
+    let k_start = chunk * slice + k_lane * lane_span;
+    var sum = 0.0;
+    if (valid) {
+        var kk = k_start;
+        let k_end = k_start + lane_span;
+        for (; kk + 4u <= k_end; kk = kk + 4u) {
+            let base_byte = col * (pc.k / 2u) + (kk / 2u);
+            let wa = packed_w[base_byte >> 2u];
+            let wb = packed_w[(base_byte + 1u) >> 2u];
+            let byte_a = (wa >> ((base_byte & 3u) * 8u)) & 0xffu;
+            let byte_b = (wb >> (((base_byte + 1u) & 3u) * 8u)) & 0xffu;
+            let q0 = select(byte_a & 0x0fu, byte_a >> 4u, (kk & 1u) != 0u);
+            let q1 = select(byte_a & 0x0fu, byte_a >> 4u, ((kk + 1u) & 1u) != 0u);
+            let q2 = select(byte_b & 0x0fu, byte_b >> 4u, ((kk + 2u) & 1u) != 0u);
+            let q3 = select(byte_b & 0x0fu, byte_b >> 4u, ((kk + 3u) & 1u) != 0u);
+            let sa0 = scales[col * blocks + kk / 32u];
+            let sa1 = scales[col * blocks + (kk + 1u) / 32u];
+            let sa2 = scales[col * blocks + (kk + 2u) / 32u];
+            let sa3 = scales[col * blocks + (kk + 3u) / 32u];
+            let av = vec4<f32>(
+                a[row * pc.k + kk],
+                a[row * pc.k + kk + 1u],
+                a[row * pc.k + kk + 2u],
+                a[row * pc.k + kk + 3u],
+            );
+            let wv = vec4<f32>(
+                (f32(q0) - 8.0) * sa0,
+                (f32(q1) - 8.0) * sa1,
+                (f32(q2) - 8.0) * sa2,
+                (f32(q3) - 8.0) * sa3,
+            );
+            sum = sum + dot(av, wv);
+        }
+    }
+    lds[tid] = sum;
+    workgroupBarrier();
+    // Intra-chunk tree-reduce across the 8 k-lanes (validated deterministic on
+    // RADV); lane 0 of each column holds the chunk's partial.
+    for (var s = KL / 2u; s > 0u; s = s / 2u) {
+        if (k_lane < s) {
+            lds[tid] = lds[tid] + lds[tid + s * COLS];
+        }
+        workgroupBarrier();
+    }
+    if (k_lane == 0u && valid) {
+        partial[(row * pc.k_chunks + chunk) * pc.n + col] = lds[tid];
+    }
+}
+"#;
+
+/// Second pass of inter-workgroup split-K: sums the `k_chunks` per-column
+/// partials (fixed chunk order) into the output. One thread per output element.
+/// Push is `{m,k,n,k_chunks}` (only m, n, k_chunks are read).
+pub const MATMUL_NBITS_Q4_SPLITK_REDUCE: &str = r#"
+struct Params { m: u32, k: u32, n: u32, k_chunks: u32 }
+var<immediate> pc: Params;
+
+@group(0) @binding(0) var<storage, read> partial: array<f32>;
+@group(0) @binding(1) var<storage, read_write> y: array<f32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = pc.m * pc.n;
+    if (idx >= total) { return; }
+    let row = idx / pc.n;
+    let col = idx - row * pc.n;
+    var sum = 0.0;
+    for (var c = 0u; c < pc.k_chunks; c++) {
+        sum = sum + partial[(row * pc.k_chunks + c) * pc.n + col];
+    }
+    y[idx] = sum;
+}
+"#;
+
+/// Push-constant size for the inter-workgroup split-K pair: {m,k,n,k_chunks}.
+pub const SPLITK_DEEP_PUSH_BYTES: u32 = 16;
+/// Bindings for the deep (pass-1) kernel: a, packed_w, scales, partial.
+pub const SPLITK_DEEP_BINDINGS: u32 = 4;
+/// Bindings for the reduce (pass-2) kernel: partial, y.
+pub const SPLITK_REDUCE_BINDINGS: u32 = 2;
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -235,5 +363,9 @@ mod tests {
             .expect("MatMulNBits Q4 tiled shader must compile to SPIR-V");
         vk_compute::compile_wgsl(super::MATMUL_NBITS_Q4_SPLITK)
             .expect("MatMulNBits Q4 split-K shader must compile to SPIR-V");
+        vk_compute::compile_wgsl(super::MATMUL_NBITS_Q4_SPLITK_DEEP)
+            .expect("MatMulNBits Q4 split-K-deep (pass 1) must compile to SPIR-V");
+        vk_compute::compile_wgsl(super::MATMUL_NBITS_Q4_SPLITK_REDUCE)
+            .expect("MatMulNBits Q4 split-K-deep reduce (pass 2) must compile to SPIR-V");
     }
 }
