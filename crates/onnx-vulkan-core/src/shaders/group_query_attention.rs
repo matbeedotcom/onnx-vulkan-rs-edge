@@ -2,7 +2,7 @@
 //! LFM2.5 decoding. One workgroup owns one `(batch, query, query-head)`.
 
 pub const BINDINGS: u32 = 10;
-pub const PUSH_BYTES: u32 = 36;
+pub const PUSH_BYTES: u32 = 40;
 pub const MAX_CONTEXT: u32 = 4096;
 
 pub const GQA: &str = r#"
@@ -19,11 +19,29 @@ pub const GQA: &str = r#"
 
 struct Push {
     batch: u32, seq: u32, q_heads: u32, kv_heads: u32, head_dim: u32,
-    past_len: u32, total_len: u32, scale: f32, do_rotary: u32,
+    past_len: u32, total_len: u32, scale: f32, do_rotary: u32, qk_reorder: u32,
 }
 var<immediate> pc: Push;
 var<workgroup> scores: array<f32, 4096>;
 var<workgroup> reduce: array<f32, 256>;
+
+// With `qk_reorder`, the CURRENT q/k head storage is the pre-transpose
+// interleaved layout produced by the fused `Reshape->Transpose[0,1,2,4,3]`
+// pattern: logical head dim d lives at physical (d % half) * 2 + d / half
+// (half = head_dim/2, the [16,2] pair layout). The remap only re-addresses
+// the q/k CURRENT reads; it returns the same *values* the Transpose would
+// have produced, so every write (out, present_k, present_v) is bit-identical
+// to the un-fused path. `past_k`/`past_v` were written in logical order by an
+// earlier step, so their reads are NOT remapped. V has no rearr and is
+// untouched. Same values, same math, same order — only the load addresses
+// differ.
+fn qk_phys(d: u32) -> u32 {
+    if (pc.qk_reorder == 0u || pc.head_dim != 32u) { return d; }
+    let half = pc.head_dim / 2u;
+    let hi = d / half;
+    let lo = d - hi * half;
+    return lo * 2u + hi;
+}
 
 fn rotate_value(value: f32, other: f32, d: u32, position: u32) -> f32 {
     if (pc.do_rotary == 0u) { return value; }
@@ -37,14 +55,18 @@ fn q_value(b: u32, s: u32, h: u32, d: u32) -> f32 {
     let base = ((b * pc.seq + s) * pc.q_heads + h) * pc.head_dim;
     let half = pc.head_dim / 2u;
     let other_d = select(d + half, d - half, d >= half);
-    return rotate_value(q[base + d], q[base + other_d], d, pc.past_len + s);
+    let dp = qk_phys(d);
+    let dop = qk_phys(other_d);
+    return rotate_value(q[base + dp], q[base + dop], d, pc.past_len + s);
 }
 
 fn current_k_value(b: u32, s: u32, h: u32, d: u32) -> f32 {
     let base = ((b * pc.seq + s) * pc.kv_heads + h) * pc.head_dim;
     let half = pc.head_dim / 2u;
     let other_d = select(d + half, d - half, d >= half);
-    return rotate_value(k[base + d], k[base + other_d], d, pc.past_len + s);
+    let dp = qk_phys(d);
+    let dop = qk_phys(other_d);
+    return rotate_value(k[base + dp], k[base + dop], d, pc.past_len + s);
 }
 
 fn key_value(b: u32, kh: u32, position: u32, d: u32) -> f32 {

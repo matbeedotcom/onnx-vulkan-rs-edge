@@ -405,18 +405,67 @@ pub fn fold_constants(ir: &mut GraphIr) -> usize {
     count
 }
 
+/// Names every subgraph, at every depth, reads from its enclosing scope — the
+/// free variables whose value lives in the *parent* scope.
+///
+/// An ONNX subgraph reads a parent-scoped value either as a declared `graph.input`
+/// or, as exporters commonly emit, as a **node input** bound by name to the
+/// enclosing value (the unrolled depthformer's `If` branches read
+/// `depth_linear.weight_Q4` straight from the top-level initializers). Either way
+/// the name must stay live in the parent: its initializer must survive and the
+/// node that produces it must not be pruned. We approximate "reads but does not
+/// define here" — a superset of the true free set — so this can only ever
+/// over-keep, never wrongly drop.
+fn captured_names(ir: &GraphIr) -> Vec<String> {
+    let mut out = Vec::new();
+    for node in &ir.nodes {
+        for attr in node.attrs.values() {
+            if let Some(sub) = attr.as_graph() {
+                collect_free_reads(sub, &mut out);
+            }
+        }
+    }
+    out
+}
+
+fn collect_free_reads(sub: &GraphIr, out: &mut Vec<String>) {
+    // Declared `graph.input` names are parent-scoped values by definition.
+    out.extend(sub.inputs.iter().cloned());
+    let mut defined: HashSet<String> = sub.inputs.iter().cloned().collect();
+    for node in &sub.nodes {
+        for name in &node.outputs {
+            defined.insert(name.clone());
+        }
+    }
+    for node in &sub.nodes {
+        for name in &node.inputs {
+            if !name.is_empty() && !defined.contains(name) {
+                out.push(name.clone());
+            }
+        }
+        for attr in node.attrs.values() {
+            if let Some(nested) = attr.as_graph() {
+                collect_free_reads(nested, out);
+            }
+        }
+    }
+}
+
 /// Drops initializers no node reads. Returns the bytes released.
 ///
 /// Constant folding orphans its own inputs — the int8 weights behind 107
 /// `DequantizeLinear` are 25.5 MB nothing reads once their fp32 result is an
 /// initializer — and they are held for the session's whole life.
 pub fn prune_dead_initializers(ir: &mut GraphIr) -> usize {
+    let captured = captured_names(ir);
     let live: HashSet<&str> = ir
         .nodes
         .iter()
         .flat_map(|n| n.inputs.iter())
         .map(String::as_str)
         .chain(ir.outputs.iter().map(String::as_str))
+        // Subgraph-captured names resolve against this scope's initializers.
+        .chain(captured.iter().map(String::as_str))
         .collect();
     let dead: Vec<String> = ir
         .initializers
@@ -441,6 +490,8 @@ pub fn prune_dead_nodes(ir: &mut GraphIr) -> usize {
     let mut removed = 0;
     loop {
         let index = Index::build(ir);
+        let captured_owned = captured_names(ir);
+        let captured: HashSet<&str> = captured_owned.iter().map(String::as_str).collect();
         let before = ir.nodes.len();
         let nodes = std::mem::take(&mut ir.nodes);
         ir.nodes = nodes
@@ -449,7 +500,9 @@ pub fn prune_dead_nodes(ir: &mut GraphIr) -> usize {
                 node.outputs.iter().any(|name| {
                     !name.is_empty()
                         && (index.graph_outputs.contains(name)
-                            || index.consumers.contains_key(name))
+                            || index.consumers.contains_key(name)
+                            // A subgraph captures this value as a free variable.
+                            || captured.contains(name.as_str()))
                 })
             })
             .collect();
@@ -458,6 +511,166 @@ pub fn prune_dead_nodes(ir: &mut GraphIr) -> usize {
             return removed;
         }
     }
+}
+
+/// Whether the GQA q/k de-interleave fold is active. Read once, at executor
+/// build, from `ONNX_VULKAN_GQA_QK_REORDER` (generic core knob) or
+/// `LFM25_TRANSPOSE_FUSE` (the LFM2.5 harness alias). Off by default: the fold
+/// is a per-model optimization and must stay an explicit A/B lever until it
+/// clears a stats-off wall-time gate.
+pub fn gqa_qk_reorder_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = |name: &str| {
+            std::env::var(name).map(|v| !v.is_empty() && v != "0").unwrap_or(false)
+        };
+        on("ONNX_VULKAN_GQA_QK_REORDER") || on("LFM25_TRANSPOSE_FUSE")
+    })
+}
+
+/// Fuses the LFM2.5 depthformer `q_rearr`/`k_rearr` de-interleave into the
+/// `GroupQueryAttention` that consumes it.
+///
+/// The exporter emits `Reshape→Transpose[0,1,2,4,3]→Reshape` before each
+/// attention so that a head's 32-dim vector, stored interleaved as `[16,2]`
+/// (pair `i` adjacent), is presented in logical order. At decode every such
+/// `Transpose` is a ~320 µs dispatch over a tensor that is *immediately*
+/// read back by one GQA — 96 of them per depthformer call. `Reshape` is a
+/// metadata-only view on host and a flat copy on device, so the `Transpose`
+/// is the only physical op in the trio, and GQA is its only consumer.
+///
+/// The fusion deletes the `Transpose`, re-points the trailing `Reshape` at the
+/// pre-transpose (interleaved) buffer, and sets `qk_deint=1` on the consuming
+/// GQA, whose kernel then indexes Q/K head dims through the inverse
+/// permutation `phys(d) = (d % half) * 2 + d / half` (`half = head_dim / 2`).
+/// V is un-rearranged and the KV cache is written by GQA in logical order, so
+/// neither is touched — the result is bit-identical, with 96 fewer dispatches.
+///
+/// A pattern is fused only when **all** of: the perm is exactly `[0,1,2,4,3]`;
+/// its producer is a `Reshape` and its sole consumer is a `Reshape`; that
+/// consumer's sole reader is a `com.microsoft::GroupQueryAttention` reading it
+/// as Q (input 0) or K (input 1); and head_dim (`width / heads`) is 32. Any
+/// doubt leaves the `Transpose` in place. Returns the number of nodes removed.
+pub fn fuse_gqa_qk_deint(ir: &mut GraphIr) -> usize {
+    use crate::graph::ElementType;
+    // The Reshape shape operands are `Constant` nodes, which `fold_constants`
+    // leaves in `ir.nodes` (they have no inputs), so their values live in
+    // `constant_outputs`, not `ir.initializers`. Merge both, as `fuse_layernorm`
+    // does, so the head_dim test reads the real constant.
+    let mut constants = constant_outputs(&ir.nodes);
+    constants.extend(ir.initializers.clone());
+    let index = Index::build(ir);
+    // Phase 1: decide, over an immutable view, which Transposes to delete and
+    // which trailing Reshapes to re-point. A pattern matches only when every
+    // structural test passes; any doubt leaves the Transpose in place.
+    let mut remove: HashSet<usize> = HashSet::new();
+    let mut repoint: Vec<(usize, String)> = Vec::new();
+    let mut gqa_flag: HashSet<usize> = HashSet::new();
+    for (i, node) in ir.nodes.iter().enumerate() {
+        if !is_op(node, "Transpose") || node.outputs.len() != 1 {
+            continue;
+        }
+        if node.attrs.get("perm").and_then(AttrValue::as_ints) != Some(&[0, 1, 2, 4, 3][..]) {
+            continue;
+        }
+        let out = node.outputs[0].clone();
+        let first = match index.only_consumer(&out) {
+            Some(c) => c,
+            None => continue,
+        };
+        if !is_op(&ir.nodes[first], "Reshape") || ir.nodes[first].inputs.first() != Some(&out) {
+            continue;
+        }
+        // Walk the run of sole-consumer `Reshape`s after the Transpose to the
+        // terminal consumer. `Reshape` is a flat row-major reinterpret (it never
+        // reorders bytes), so the Transpose is the only op that physically moves
+        // data; whatever Reshape count sits between it and the GQA is layout
+        // plumbing and can all keep running on the pre-transpose buffer.
+        let mut cur = ir.nodes[first].outputs[0].clone();
+        let mut gqa_i: Option<usize> = None;
+        for _ in 0..64 {
+            match index.only_consumer(&cur) {
+                Some(c) => {
+                    let n = &ir.nodes[c];
+                    if is_op(n, "Reshape") && n.inputs.first() == Some(&cur) {
+                        cur = n.outputs[0].clone();
+                        continue;
+                    }
+                    gqa_i = Some(c);
+                    break;
+                }
+                // multi-reader or a graph output: the chain is not cleanly ours.
+                None => break,
+            }
+        }
+        let gqa_i = match gqa_i {
+            Some(g) => g,
+            None => continue,
+        };
+        let gqa = &ir.nodes[gqa_i];
+        // com.microsoft::GroupQueryAttention — the de-interleave only feeds the
+        // Q/K legs of a real GQA, never some other domain's attention.
+        if gqa.op != "GroupQueryAttention" || gqa.domain != "com.microsoft" {
+            continue;
+        }
+        // Only the Q (input 0) and K (input 1) legs are de-interleaved; V is
+        // not rearranged by the exporter.
+        if !(gqa.inputs.get(0) == Some(&cur) || gqa.inputs.get(1) == Some(&cur)) {
+            continue;
+        }
+        // head_dim must be 32 for the kernel's `[16,2]` de-interleave to hold.
+        // The Reshape right after the Transpose is `[batch, 1, heads, head_dim]`;
+        // its leading dims may be `0`/`-1` (dynamic), so only the LAST dim — the
+        // head dim — must be the constant 32. The shape operand is a `Constant`
+        // node kept in `ir.nodes` by `fold_constants`, so `constants` (merged
+        // above) resolves it.
+        let head_dim = ir.nodes[first]
+            .inputs
+            .get(1)
+            .and_then(|c| constants.get(c))
+            .filter(|t| t.dtype == ElementType::Int64 as i32)
+            .and_then(|t| {
+                let h = HostTensor::new(t.dtype, t.shape.clone(), t.data.clone());
+                let v = h.to_i64().ok()?;
+                v.last().copied().filter(|&d| d > 0)
+            });
+        if head_dim != Some(32) {
+            continue;
+        }
+        remove.insert(i);
+        // Re-point the FIRST trailing Reshape at the pre-transpose (interleaved)
+        // buffer; the rest of the run follow it automatically.
+        repoint.push((first, node.inputs[0].clone()));
+        gqa_flag.insert(gqa_i);
+    }
+    if remove.is_empty() {
+        return 0;
+    }
+    // Phase 2: apply the mutations on a mutable view.
+    for (i, src) in &repoint {
+        ir.nodes[*i].inputs[0] = src.clone();
+    }
+    for &g in &gqa_flag {
+        ir.nodes[g]
+            .attrs
+            .entry("qk_reorder".to_string())
+            .or_insert_with(|| AttrValue::Int(1))
+            .clone_from(&AttrValue::Int(1));
+    }
+    let before = ir.nodes.len();
+    let nodes = std::mem::take(&mut ir.nodes);
+    ir.nodes = nodes
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, n)| (!remove.contains(&i)).then_some(n))
+        .collect();
+    let removed = before - ir.nodes.len();
+    let left = ir.nodes.iter().filter(|n| is_op(n, "Transpose")).count();
+    log::info!(
+        "tfuse: {g} GQA nodes flagged qk-deint, removed {removed} rearr Transposes ({left} left)",
+        g = gqa_flag.len()
+    );
+    removed
 }
 
 #[cfg(test)]
@@ -538,6 +751,176 @@ mod tests {
 
     /// rfdetr writes the same nine nodes over the channel axis. That is a
     /// different operator and the kernel normalizes the last axis only.
+    fn int64_vec(vals: &[i64]) -> InitializerIr {
+        InitializerIr {
+            dtype: ElementType::Int64 as i32,
+            shape: vec![vals.len() as i64],
+            data: vals.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        }
+    }
+
+    /// A `Constant` node whose `value` is an int64 tensor — how the real graph
+    /// carries the Reshape shape operands (they never land in `initializers`).
+    fn constant(name: &str, vals: &[i64]) -> NodeIr {
+        let mut n = node("Constant", &[], name);
+        n.attrs.insert("value".into(), AttrValue::Tensor(int64_vec(vals)));
+        n
+    }
+
+    /// A `com.microsoft::GroupQueryAttention` reading `q`/`k`/`v` plus the KV
+    /// cache and rotary tables — the minimum surface the matcher checks.
+    fn gqa(q: &str, k: &str, v: &str) -> NodeIr {
+        let mut n = NodeIr {
+            domain: "com.microsoft".into(),
+            op: "GroupQueryAttention".into(),
+            since_version: 21,
+            name: "gqa".into(),
+            inputs: [q, k, v, "pk", "pv", "seqlens", "total", "cos", "sin"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            outputs: vec!["attn".into(), "pres_k".into(), "pres_v".into()],
+            attrs: HashMap::new(),
+        };
+        n.attrs.insert("num_heads".into(), AttrValue::Int(32));
+        n.attrs.insert("kv_num_heads".into(), AttrValue::Int(8));
+        n.attrs.insert("scale".into(), AttrValue::Float(1.0 / 32.0_f32.sqrt()));
+        n
+    }
+
+    /// `q_rearr` as the real graph emits it: `Reshape5d → Transpose[0,1,2,4,3]`
+    /// → **two** flat `Reshape`s → GQA.q, with the shape Constants in `ir.nodes`
+    /// (never in `initializers`).
+    fn rearr_graph() -> GraphIr {
+        let mut perm_node = node("Transpose", &["in5"], "tout");
+        perm_node
+            .attrs
+            .insert("perm".into(), AttrValue::Ints(vec![0, 1, 2, 4, 3]));
+        GraphIr {
+            nodes: vec![
+                constant("shape5d", &[0, 1, 32, 16, 2]),
+                constant("shape4d", &[0, 1, 32, 32]),
+                constant("shape1024", &[0, 1, 1024]),
+                node("Reshape", &["ln_out", "shape5d"], "in5"),
+                perm_node,
+                node("Reshape", &["tout", "shape4d"], "q3d"),
+                node("Reshape", &["q3d", "shape1024"], "qflat"),
+                gqa("qflat", "k3d", "v3d"),
+            ],
+            initializers: HashMap::new(),
+            inputs: vec![
+                "ln_out".into(),
+                "k3d".into(),
+                "v3d".into(),
+                "pk".into(),
+                "pv".into(),
+                "seqlens".into(),
+                "total".into(),
+                "cos".into(),
+                "sin".into(),
+            ],
+            outputs: vec!["attn".into(), "pres_k".into(), "pres_v".into()],
+        }
+    }
+
+    #[test]
+    fn fuses_the_q_rearr_into_gqa() {
+        let mut ir = rearr_graph();
+        assert_eq!(fuse_gqa_qk_deint(&mut ir), 1, "the rearr Transpose must be removed");
+        // The trailing Reshape now views the PRE-transpose buffer.
+        let reshaped = ir.nodes.iter().find(|n| n.name == "q3d").unwrap();
+        assert_eq!(reshaped.inputs, ["in5", "shape4d"]);
+        // The GQA is flagged to de-interleave q/k at the load.
+        let g = ir.nodes.iter().find(|n| n.op == "GroupQueryAttention").unwrap();
+        assert_eq!(g.attrs["qk_reorder"], AttrValue::Int(1));
+        // No Transpose left.
+        assert!(!ir.nodes.iter().any(|n| n.op == "Transpose"));
+        // 8 nodes (3 Constant + Reshape + Transpose + Reshape + Reshape + GQA)
+        // -> 7 after the Transpose is removed.
+        assert_eq!(ir.nodes.len(), 7);
+    }
+
+    #[test]
+    fn leaves_a_non_rearr_perm_alone() {
+        let mut ir = rearr_graph();
+        // Change the perm to something the kernel does not understand.
+        let t = ir.nodes.iter_mut().find(|n| n.op == "Transpose").unwrap();
+        t.attrs.insert("perm".into(), AttrValue::Ints(vec![0, 1, 2, 3, 4]));
+        assert_eq!(fuse_gqa_qk_deint(&mut ir), 0);
+        assert!(ir.nodes.iter().any(|n| n.op == "Transpose"));
+    }
+
+    #[test]
+    fn leaves_a_double_consume_rearr_alone() {
+        let mut ir = rearr_graph();
+        // A second top-level reader of the transpose output means the value is
+        // not the pattern's sole consumer, so it cannot be deleted.
+        ir.nodes.push(node("Identity", &["tout"], "tout_copy"));
+        ir.outputs.push("tout_copy".into());
+        assert_eq!(fuse_gqa_qk_deint(&mut ir), 0);
+        assert!(ir.nodes.iter().any(|n| n.op == "Transpose"));
+    }
+
+    /// Regression for the unrolled depthformer: an initializer that no
+    /// *top-level* node reads but that a subgraph captures as a free variable
+    /// (`depth_linear.weight_Q4`, read by all eight `If` branches) must survive
+    /// `prune_dead_initializers`, and the node producing a captured value must
+    /// survive `prune_dead_nodes`.
+    #[test]
+    fn keeps_subgraph_captured_values_alive() {
+        // A subgraph that reads the parent initializer `w` in TWO ways:
+        //  (a) as a declared free variable (`graph.input`), and
+        //  (b) as a bare node input bound by name to the parent value — how
+        //      the unrolled depthformer's `If` branches read `depth_linear.weight_Q4`.
+        // Both must keep `w` alive in the parent scope.
+        let sub = GraphIr {
+            nodes: vec![
+                node("Identity", &["w"], "w_use_declared"),
+                node("Identity", &["w"], "w_use_bare"),
+            ],
+            initializers: HashMap::new(),
+            inputs: vec!["w".into()],
+            outputs: vec!["w_use_declared".into(), "w_use_bare".into()],
+        };
+        let mut branch = node("If", &["cond"], "branch_out");
+        branch
+            .attrs
+            .insert("then_branch".into(), AttrValue::Graph(Box::new(sub)));
+
+        let mut ir = GraphIr {
+            nodes: vec![branch.clone()],
+            initializers: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "w".into(),
+                    InitializerIr {
+                        dtype: ElementType::Float32 as i32,
+                        shape: vec![4],
+                        data: vec![0u8; 16],
+                    },
+                );
+                m
+            },
+            inputs: vec!["cond".into()],
+            outputs: vec!["branch_out".into()],
+        };
+        let released = prune_dead_initializers(&mut ir);
+        assert_eq!(released, 0, "subgraph-read initializer must not be pruned");
+        assert!(ir.initializers.contains_key("w"));
+        // A producer of a value the subgraph reads must survive too.
+        let mut ir2 = GraphIr {
+            nodes: vec![node("Identity", &["x"], "w"), branch.clone()],
+            initializers: HashMap::new(),
+            inputs: vec!["x".into(), "cond".into()],
+            outputs: vec!["branch_out".into()],
+        };
+        let dropped = prune_dead_nodes(&mut ir2);
+        assert!(
+            ir2.nodes.iter().any(|n| n.name == "w"),
+            "subgraph-read producer must not be pruned (dropped {dropped})"
+        );
+    }
+
     #[test]
     fn leaves_a_channel_axis_normalization_alone() {
         let mut ir = decomposed(1);

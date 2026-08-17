@@ -38,12 +38,21 @@ impl<'context> Executor<'context> {
         // path and the ORT plugin cannot end up running different graphs.
         let fused = crate::rewrite::fuse_layernorm(&mut ir);
         let folded = crate::rewrite::fold_constants(&mut ir);
-        if fused > 0 || folded > 0 {
+        // The GQA q/k de-interleave fold needs the Reshape shape constants
+        // already in `initializers`, so it runs after `fold_constants` and
+        // re-prunes the orphaned constants it leaves behind.
+        let gqa_fused = if crate::rewrite::gqa_qk_reorder_enabled() {
+            crate::rewrite::fuse_gqa_qk_deint(&mut ir)
+        } else {
+            0
+        };
+        if fused > 0 || folded > 0 || gqa_fused > 0 {
             let pruned = crate::rewrite::prune_dead_nodes(&mut ir);
             let released = crate::rewrite::prune_dead_initializers(&mut ir);
             log::info!(
                 "rewrite: {fused} decomposed LayerNormalization fused, \
-                 {folded} constant nodes folded, {pruned} orphaned nodes pruned, \
+                 {folded} constant nodes folded, {gqa_fused} GQA q/k rearr fused, \
+                 {pruned} orphaned nodes pruned, \
                  {:.1} MB of initializers released, {} nodes left",
                 released as f64 / 1e6,
                 ir.nodes.len()

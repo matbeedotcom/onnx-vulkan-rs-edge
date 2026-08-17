@@ -1202,6 +1202,15 @@ fn group_query_attention(env: &mut Env, node: &NodeIr) -> Result<()> {
         .get("do_rotary")
         .and_then(AttrValue::as_i64)
         .unwrap_or(0);
+    // Set by `rewrite::fuse_gqa_qk_deint` when the q_rearr/k_rearr Transpose
+    // feeding this GQA was folded away: the q/k CURRENT head storage is then
+    // still the pre-transpose interleaved layout and the kernel de-interleaves
+    // at the load. The KV cache and V are unaffected.
+    let qk_reorder = node
+        .attrs
+        .get("qk_reorder")
+        .and_then(AttrValue::as_i64)
+        .unwrap_or(0);
     let mut push = Vec::with_capacity(GQA_PUSH_BYTES as usize);
     for value in [
         batch as u32,
@@ -1216,6 +1225,7 @@ fn group_query_attention(env: &mut Env, node: &NodeIr) -> Result<()> {
     }
     push.extend_from_slice(&scale.to_le_bytes());
     push.extend_from_slice(&(do_rotary as u32).to_le_bytes());
+    push.extend_from_slice(&(qk_reorder as u32).to_le_bytes());
     with_pipeline(
         env.cache(),
         "GroupQueryAttention",
