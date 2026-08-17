@@ -355,10 +355,15 @@ impl Session {
         )
     }
 
-    /// Runs with host inputs and/or device-resident values from a prior run.
-    pub fn run_values<'a, N>(
+    /// Runs with host inputs and/or device-resident values from a prior run,
+    /// computing only the graph outputs reachable from `wanted` (dead-code
+    /// elimination). `None` runs the full graph. See
+    /// `onnx_vulkan_core::Executor::run_wanted` for the contract: list every
+    /// output you read via [`Run::get`] **and** [`Run::take_device`].
+    pub fn run_values_wanted<'a, N>(
         &'a self,
         inputs: impl IntoIterator<Item = (N, InputValue)>,
+        wanted: Option<Vec<String>>,
     ) -> Result<Run<'a>>
     where
         N: AsRef<str>,
@@ -391,8 +396,19 @@ impl Session {
             })
             .collect();
         Ok(Run {
-            outputs: self.executor.run(bound)?,
+            outputs: self.executor.run_wanted(bound, wanted)?,
         })
+    }
+
+    /// Runs with host inputs and/or device-resident values from a prior run.
+    pub fn run_values<'a, N>(
+        &'a self,
+        inputs: impl IntoIterator<Item = (N, InputValue)>,
+    ) -> Result<Run<'a>>
+    where
+        N: AsRef<str>,
+    {
+        self.run_values_wanted(inputs, None)
     }
 }
 

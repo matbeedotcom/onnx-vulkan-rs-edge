@@ -344,8 +344,25 @@ fn with_pipeline<R>(
 /// Internal errors (anyhow, with context chain) are flattened into the core's
 /// typed error: the public API does not expose `anyhow`.
 pub fn execute(ir: &GraphIr, env: &mut Env<'_, '_>) -> crate::Result<()> {
+    execute_wanted(ir, env, None)
+}
+
+/// Executes the graph, optionally pruning to the values reachable from
+/// `wanted` declared outputs (dead-code elimination). `None` runs the full
+/// graph. The pruning is conservative: it only ever *removes* a node whose
+/// outputs nobody downstream consumes, so a full run and a `wanted`-run that
+/// names every declared output are node-for-node identical.
+///
+/// `If` branches are not planned: an `If` whose outputs are needed runs its
+/// whole subgraph. (The LFM2.5 decoder is straight-line, so its lm_head prunes;
+/// the depthformer's `If` blocks are kept whole.)
+pub fn execute_wanted(
+    ir: &GraphIr,
+    env: &mut Env<'_, '_>,
+    wanted: Option<&[String]>,
+) -> crate::Result<()> {
     let t0 = std::time::Instant::now();
-    let result = execute_nodes(ir, env).map_err(|e| crate::Error::Backend(format!("{e:#}")));
+    let result = execute_nodes(ir, env, wanted).map_err(|e| crate::Error::Backend(format!("{e:#}")));
     if vk_compute::trace::enabled() {
         let wall = t0.elapsed().as_nanos() as u64;
         let summary = vk_compute::trace::summary("graph");
@@ -358,16 +375,19 @@ pub fn execute(ir: &GraphIr, env: &mut Env<'_, '_>) -> crate::Result<()> {
     result
 }
 
-fn execute_nodes(ir: &GraphIr, env: &mut Env<'_, '_>) -> Result<()> {
+fn execute_nodes(ir: &GraphIr, env: &mut Env<'_, '_>, wanted: Option<&[String]>) -> Result<()> {
     let dead = dead_after(ir);
+    let kept = kept_nodes(ir, wanted);
+    let pruned = kept.iter().filter(|k| !**k).count();
+    if vk_compute::stats::enabled() && pruned > 0 {
+        eprintln!("[dce] kept {}/{} nodes ({} wanted outputs)", kept.iter().filter(|k| **k).count(), ir.nodes.len(), wanted.map(|w| w.len()).unwrap_or(ir.outputs.len()));
+    }
     let tracing = vk_compute::trace::enabled();
-    // Per-node-type host wall time (ns) + count, for the current graph. The
-    // stream is async, so this is host recording cost (descriptor alloc +
-    // update + cmd recording + buffer pool churn), not GPU execution. A node
-    // type that is 10-30x slower per dispatch than its siblings points at the
-    // inefficiency (usually buffer-pool misses or a slow host-side kernel).
     let mut node_ns: HashMap<&str, (u64, usize)> = HashMap::new();
     for (index, node) in ir.nodes.iter().enumerate() {
+        if !kept[index] {
+            continue;
+        }
         let t0 = tracing.then(std::time::Instant::now);
         exec_node(env, node)?;
         if let Some(t0) = t0 {
@@ -383,6 +403,89 @@ fn execute_nodes(ir: &GraphIr, env: &mut Env<'_, '_>) -> Result<()> {
         vk_compute::trace::dump_node_types(&node_ns);
     }
     Ok(())
+}
+
+/// Backward pass marking the nodes reachable from the wanted outputs. Seeds a
+/// frontier with `wanted` (or every declared output when `None`) and walks
+/// *backwards* through producers: a value needed by the frontier makes its
+/// producing node kept, and that node's inputs join the frontier. ONNX values
+/// have a single producer, so the producer map is unambiguous. `If` nodes pull
+/// in every value their subgraphs capture (mirroring [`dead_after`]), because
+/// the taken branch reads them at runtime even though they are not in the
+/// `If`'s own `inputs`. Graph inputs and initializers are roots: they have no
+/// producing node to keep.
+fn kept_nodes(ir: &GraphIr, wanted: Option<&[String]>) -> Vec<bool> {
+    let mut producer: HashMap<&str, usize> = HashMap::new();
+    for (i, node) in ir.nodes.iter().enumerate() {
+        for o in &node.outputs {
+            producer.insert(o.as_str(), i);
+        }
+    }
+    let graph_inputs: std::collections::HashSet<&str> =
+        ir.inputs.iter().map(String::as_str).collect();
+
+    let mut kept = vec![false; ir.nodes.len()];
+    let mut frontier: std::collections::VecDeque<&str> = std::collections::VecDeque::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    match wanted {
+        Some(w) => {
+            for name in w {
+                let n = name.as_str();
+                if !n.is_empty() && seen.insert(n) {
+                    frontier.push_back(n);
+                }
+            }
+        }
+        None => {
+            for name in &ir.outputs {
+                let n = name.as_str();
+                if !n.is_empty() && seen.insert(n) {
+                    frontier.push_back(n);
+                }
+            }
+        }
+    }
+    while let Some(name) = frontier.pop_front() {
+        let Some(&i) = producer.get(name) else {
+            continue; // graph input / initializer / not produced here
+        };
+        if kept[i] {
+            continue;
+        }
+        kept[i] = true;
+        let node = &ir.nodes[i];
+        // Inputs of the kept node become needed. An `If` also reads every value
+        // its subgraphs capture (not listed in `node.inputs`), so those are
+        // needed too — mirroring [`dead_after`].
+        let mut needed_inputs: Vec<&str> = node
+            .inputs
+            .iter()
+            .map(String::as_str)
+            .collect();
+        if node.op == "If" {
+            for branch in ["then_branch", "else_branch"] {
+                if let Some(graph) = node.attrs.get(branch).and_then(AttrValue::as_graph) {
+                    for sub in &graph.nodes {
+                        for inp in &sub.inputs {
+                            needed_inputs.push(inp.as_str());
+                        }
+                    }
+                }
+            }
+        }
+        for inp in needed_inputs {
+            if inp.is_empty() || graph_inputs.contains(inp) {
+                continue;
+            }
+            if ir.initializers.contains_key(inp) {
+                continue;
+            }
+            if seen.insert(inp) {
+                frontier.push_back(inp);
+            }
+        }
+    }
+    kept
 }
 
 /// For each node, the values for which that node is the last reader.
@@ -5358,5 +5461,100 @@ mod host_transpose_2d_tests {
         // The actual [65536, 2048] activation (134M elems). Reference is the
         // generic O(n*rank) loop's mapping; both must agree byte-for-byte.
         assert!(run(UINT8, 65536, 2048, 8));
+    }
+}
+
+#[cfg(test)]
+mod dce_tests {
+    use super::kept_nodes;
+    use crate::{GraphIr, NodeIr};
+    use std::collections::HashMap;
+
+    fn node(op: &str, inputs: &[&str], outputs: &[&str]) -> NodeIr {
+        NodeIr {
+            domain: String::new(),
+            op: op.to_string(),
+            since_version: 1,
+            name: String::new(),
+            inputs: inputs.iter().map(|s| s.to_string()).collect(),
+            outputs: outputs.iter().map(|s| s.to_string()).collect(),
+            attrs: HashMap::new(),
+        }
+    }
+
+    /// Shape:
+    ///   x (graph input) --A--> a
+    ///   a --B--> b
+    ///   b --C(hidden)--> c        (c also feeds lm_head below)
+    ///   b --D(present)--> p
+    ///   c --E(lm_head)--> logits
+    ///   logits --F(ArgMax)--> token_id
+    /// Declared outputs: [c, p, logits, token_id].
+    fn graph() -> GraphIr {
+        let mut initializers = HashMap::new();
+        // E's weight is an initializer (a root, never kept as a node).
+        initializers.insert(
+            "w".to_string(),
+            crate::InitializerIr {
+                dtype: 1,
+                shape: vec![1],
+                data: vec![0],
+            },
+        );
+        GraphIr {
+            nodes: vec![
+                node("A", &["x"], &["a"]),
+                node("B", &["a"], &["b"]),
+                node("C", &["b"], &["c"]),
+                node("D", &["b"], &["p"]),
+                node("E", &["c", "w"], &["logits"]),
+                node("F", &["logits"], &["token_id"]),
+            ],
+            initializers,
+            inputs: vec!["x".to_string()],
+            outputs: vec![
+                "c".to_string(),
+                "p".to_string(),
+                "logits".to_string(),
+                "token_id".to_string(),
+            ],
+        }
+    }
+
+    #[test]
+    fn none_keeps_everything() {
+        let g = graph();
+        let kept = kept_nodes(&g, None);
+        assert!(kept.iter().all(|k| *k), "full run must keep all nodes");
+    }
+
+    #[test]
+    fn hidden_and_present_prune_lm_head() {
+        let g = graph();
+        // Audio mode: want the hidden state c + KV present p; the lm_head
+        // (E) and ArgMax (F) chain must drop.
+        let kept = kept_nodes(&g, Some(&["c".to_string(), "p".to_string()]));
+        assert!(kept[0], "A");
+        assert!(kept[1], "B");
+        assert!(kept[2], "C (hidden)");
+        assert!(kept[3], "D (present)");
+        assert!(!kept[4], "E (lm_head) must be pruned");
+        assert!(!kept[5], "F (ArgMax) must be pruned");
+    }
+
+    #[test]
+    fn token_output_keeps_lm_head() {
+        let g = graph();
+        let kept = kept_nodes(&g, Some(&["token_id".to_string()]));
+        assert!(kept[4], "E (lm_head) needed for token_id");
+        assert!(kept[5], "F (ArgMax) needed for token_id");
+        assert!(!kept[3], "D (present) not requested -> pruned");
+    }
+
+    #[test]
+    fn unknown_output_keeps_nothing() {
+        let g = graph();
+        let kept = kept_nodes(&g, Some(&["nope".to_string()]));
+        assert!(kept.iter().all(|k| !*k));
     }
 }

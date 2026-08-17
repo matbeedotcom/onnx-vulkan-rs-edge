@@ -12,7 +12,8 @@
 //! as long as its outputs are read.
 
 use crate::{
-    ExecutionEnv, GraphIr, HostTensor, KernelCache, Result, Tensor, execute, is_implemented_node,
+    ExecutionEnv, GraphIr, HostTensor, KernelCache, Result, Tensor, execute_wanted,
+    is_implemented_node,
 };
 use vk_compute::VkContext;
 
@@ -100,12 +101,33 @@ impl<'context> Executor<'context> {
     /// output into a buffer of its own inside the same command buffer, without
     /// a round trip through host memory.
     pub fn run<'a>(&'a self, inputs: Vec<(&str, Tensor<'a>)>) -> Result<Outputs<'a>> {
+        self.run_wanted(inputs, None)
+    }
+
+    /// Runs the graph computing only the values reachable from `wanted`
+    /// graph outputs (dead-code elimination). `None` computes every declared
+    /// output — the historical behavior. Callers that consume a subset (a host
+    /// reads some, `take_device` detaches others) must list **all** of them,
+    /// or the pruned branch's values won't be produced.
+    pub fn run_wanted<'a>(
+        &'a self,
+        inputs: Vec<(&str, Tensor<'a>)>,
+        wanted: Option<Vec<String>>,
+    ) -> Result<Outputs<'a>> {
         let mut env = ExecutionEnv::new(&self.cache, &self.ir.initializers);
         for (name, tensor) in inputs {
             env.set(name, tensor);
         }
-        execute(&self.ir, &mut env)?;
-        Ok(Outputs { env })
+        let wanted = match &wanted {
+            Some(w) if w.is_empty() => None,
+            Some(w) => Some(w.clone()),
+            None => None,
+        };
+        execute_wanted(&self.ir, &mut env, wanted.as_deref())?;
+        Ok(Outputs {
+            env,
+            wanted_outputs: wanted,
+        })
     }
 }
 
@@ -119,6 +141,11 @@ impl<'context> Executor<'context> {
 /// a graph whose outputs are not declared holds nothing at the end.
 pub struct Outputs<'a> {
     env: ExecutionEnv<'a, 'a>,
+    /// Outputs the caller asked for under DCE; `None` = the full graph ran.
+    /// Used only to report, not to gate reads (the env already lacks pruned
+    /// values).
+    #[allow(dead_code)]
+    wanted_outputs: Option<Vec<String>>,
 }
 
 impl<'a> Outputs<'a> {
