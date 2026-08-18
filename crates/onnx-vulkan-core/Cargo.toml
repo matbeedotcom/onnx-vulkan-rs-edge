@@ -20,3 +20,6 @@ name = "onnx_vulkan_core"
 vk-compute = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }
+
+[dev-dependencies]
+onnx-vulkan-frontend = { workspace = true }

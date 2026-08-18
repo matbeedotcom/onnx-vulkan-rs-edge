@@ -715,6 +715,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "log",
+ "onnx-vulkan-frontend",
  "vk-compute",
 ]
 

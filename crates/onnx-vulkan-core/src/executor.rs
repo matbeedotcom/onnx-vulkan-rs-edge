@@ -46,13 +46,26 @@ impl<'context> Executor<'context> {
         } else {
             0
         };
-        if fused > 0 || folded > 0 || gqa_fused > 0 {
+        // The depthformer constant-index folds (get_slice → device Slice,
+        // prev_embed const mask) run last: they read the Reshape/Concat shape
+        // constants that `fold_constants` may have promoted, and they must be
+        // in place before the orphan prunes so the shapes they leave behind
+        // are released.
+        let (slice_folds, mask_folds) = if crate::rewrite::df_folds_enabled() {
+            let s = crate::rewrite::fold_const_get_slice(&mut ir);
+            let m = crate::rewrite::fold_prev_embed_const_mask(&mut ir);
+            (s, m)
+        } else {
+            (0, 0)
+        };
+        if fused > 0 || folded > 0 || gqa_fused > 0 || slice_folds > 0 || mask_folds > 0 {
             let pruned = crate::rewrite::prune_dead_nodes(&mut ir);
             let released = crate::rewrite::prune_dead_initializers(&mut ir);
             log::info!(
                 "rewrite: {fused} decomposed LayerNormalization fused, \
                  {folded} constant nodes folded, {gqa_fused} GQA q/k rearr fused, \
-                 {pruned} orphaned nodes pruned, \
+                 {slice_folds} const get_slice → Slice, {mask_folds} prev_embed mask \
+                 folded, {pruned} orphaned nodes pruned, \
                  {:.1} MB of initializers released, {} nodes left",
                 released as f64 / 1e6,
                 ir.nodes.len()

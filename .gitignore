@@ -10,3 +10,7 @@ __pycache__/
 *.pyc
 *.md
 !README.md
+# Large external-data fixture for the depthformer rewrite test (187 MB; shared
+# with the production model). The 404 KB graph is committed; the data file is
+# restored from lfm25-audio-onnx/dist or the Deck CAS when the test needs it.
+crates/onnx-vulkan-core/tests/models/*.onnx_data
